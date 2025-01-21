@@ -1,5 +1,5 @@
-import os
 import sys
+import os
 import json
 import time
 import subprocess
@@ -112,7 +112,8 @@ def generate_caption(model, frame, prompt):
 
 def replace_umlaute(text: str) -> str:
     """
-    Replaces German special characters with substitute characters.
+    Replaces German special characters and others that can't
+    be displayed by OpenCV with substitute characters.
     """
     return (
         text.replace("ä", "ae")
@@ -497,22 +498,26 @@ def main():
     mode = "watching"
     global audio_enabled
     global language
+
     latest_frame = None
-    captioning_prompt = "Describe this image in a short single sentence. Please do not exceed 15 words in total."
+    frozen_image = None
+
+    captioning_prompt_en = "Describe this image in a short single sentence. Please do not exceed 15 words in total."
+    captioning_prompt_de = "Beschreibe dieses Bild in einem einzigen kurzen Satz. Verwende auf keinen Fall mehr als insgesamt 15 Worte in deiner Antwort."
+    assistant_prompt_en = "You are assisting a visually impaired person. Their question and the image they 'see' are provided. Answer concisely to directly address their question based on the visual and contextual input. Please do not exceed 25 words in total. Here comes the user's request: "
+    assistant_prompt_de = "Du unterstützt eine sehbehinderte Person. Ihre Frage und das Bild, das sie 'sieht', werden bereitgestellt. Antworte präzise und gehe direkt auf die Frage ein, basierend auf den visuellen und kontextuellen Eingaben. Nutze auf keinen Fall mehr als 25 Worte. Hier ist die Frage des Nutzers: "
+    captioning_prompt = captioning_prompt_en
+    assistant_prompt = assistant_prompt_en
+
     latest_instruction = ""
-    last_instruction = ""
     latest_caption = "No caption available"
     executor = ThreadPoolExecutor(max_workers=1)
     caption_future = None
+    waiting_for_response = False
 
     def update_caption_in_background(model, frame, prompt):
         nonlocal latest_caption
-        prompt = (
-            prompt
-            + ". Please answer in German. Stell dir vor, die Kameraperspektive ist von einer Brille, die eine sehbehinderte Person trägt. Deine Aufgabe ist es, dieser Person zu helfen, sich in der Welt zurechtzufinden. Beantworte dafür bitte zielgerichtet die gestellte Frage. "
-            if language == "de"
-            else prompt
-        )
+        prompt = prompt
         response = generate_caption(model, frame, prompt)
         latest_caption = response
         add_caption_to_queue(response)
@@ -536,6 +541,7 @@ def main():
 
     # PLL = np.linspace(0, 48000 * 5, 48000 * 5)
 
+    # Start the program loop
     try:
         while not quit_keypress():
             # Retrieve the current RGB image
@@ -597,12 +603,18 @@ def main():
                 )
                 continue
 
-            # Update caption based on specified interval
+            # For the assisting mode, get the image at the moment the user starts speaking
+            if frozen_image is None:
+                frozen_image = latest_frame
+
+            # Update caption based on mode
             current_time = time.time()
-            if mode == "captioning" and (
-                current_time - last_caption_time >= caption_interval
-            ):
-                if caption_future is None or caption_future.done():
+            if caption_future is None or caption_future.done():
+
+                # Captioning mode
+                if mode == "captioning" and (
+                    current_time - last_caption_time >= caption_interval
+                ):
                     caption_future = executor.submit(
                         update_caption_in_background,
                         model,
@@ -614,18 +626,17 @@ def main():
                     )
                     last_caption_time = current_time
 
-            elif (
-                mode == "assisting" and not latest_instruction == last_instruction
-            ):  # TODO bessere Lösung (queue)
-                if caption_future is None or caption_future.done():
+                # Vision assistant mode
+                elif mode == "assisting" and waiting_for_response:
+                    image = frozen_image if frozen_image is not None else latest_frame
+                    prompt = assistant_prompt + latest_instruction
                     caption_future = executor.submit(
                         update_caption_in_background,
                         model,
-                        latest_frame,
-                        latest_instruction
-                        + ". Please do not exceed 20 words in total.",
+                        image,
+                        prompt,
                     )
-                    last_instruction = latest_instruction
+                    waiting_for_response = False
 
             # Add caption to frame if captioning is enabled
             frame_with_caption = (
@@ -646,15 +657,14 @@ def main():
             elif key == ord("x"):
                 mode = "watching"
                 print("Watching mode is active.")
+
             # Activate caption mode
             elif key == ord("c"):
                 mode = "captioning"
 
                 # Empty the queue
-                try:
+                while not caption_queue.empty():
                     caption_queue.get_nowait()
-                except queue.Empty:
-                    pass
 
                 latest_caption = "No caption available"
                 print(f"Captioning mode active. Interval: {caption_interval}s.")
@@ -662,40 +672,51 @@ def main():
                 mode = "assisting"
 
                 # Empty the queue
-                try:
+                while not caption_queue.empty():
                     caption_queue.get_nowait()
-                except queue.Empty:
-                    pass
 
                 latest_caption = "Press 'o' and ask a question. Press 'p' to stop."
                 print("Assisting mode is active")
+
             # Toggle audio on/off
             elif key == ord("a"):
                 audio_enabled = not audio_enabled
                 print(f"Audio {'enabled' if audio_enabled else 'disabled'}.")
+
             # Switch camera
             elif key == ord("1"):
                 camera_index = (
                     camera_index + 1 if camera_index < len(cameras) - 1 else 0
                 )
                 print(f"Switching to camera: {cameras[camera_index]}")
+
+            # Listen to user
             elif (
                 key == ord("o") and not listening and mode == "assisting"
             ):  # Press down the key
                 print("Höre zu.")
                 listening = True
+                frozen_image = None
                 audio_buffer = np.array((blocksize, channels))
             elif listening and key == ord("p"):  # Release the key
                 listening = False
                 latest_instruction = transcribe_audio(recognizer)
-            elif key == ord("l"):  # Toggle language between German and English
+                waiting_for_response = True
+
+            # Toggle language between German and English
+            elif key == ord("l"):
                 if language == "en":
                     language = "de"
                     recognizer = recognizer_de
+                    captioning_prompt = captioning_prompt_de
+                    assistant_prompt = assistant_prompt_de
                 else:
                     language = "en"
                     recognizer = recognizer_en
+                    captioning_prompt = captioning_prompt_en
+                    assistant_prompt = assistant_prompt_en
                 print("Changed language to", language.upper())
+
             # Print help
             elif key == ord("h"):
                 display_help()
