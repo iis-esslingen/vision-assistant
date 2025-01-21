@@ -13,7 +13,7 @@ from PIL import Image
 import cv2
 import matplotlib.pyplot as plt
 import sounddevice as sd
-from vosk import Model, KaldiRecognizer
+from vosk import Model as STTModel, KaldiRecognizer
 from pydub import AudioSegment
 import simpleaudio as sa
 
@@ -110,6 +110,15 @@ def generate_caption(model, frame, prompt):
     return result
 
 
+def replace_umlaute(text: str) -> str:
+    """
+    Replaces German special characters with substitute characters.
+    """
+    return (
+        text.replace("ä", "ae").replace("ö", "oe").replace("ü", "ue").replace("ß", "ss")
+    )
+
+
 # Function to split the text into multiple lines that fit within the image width
 def wrap_text(text, font, font_scale, thickness, img_width):
     words = text.split(" ")
@@ -144,6 +153,7 @@ def add_caption_to_frame(
     thickness=1,
 ):
     img_height, img_width, _ = frame.shape
+    text = replace_umlaute(text)
     lines = wrap_text(text, font, font_scale, thickness, img_width)
 
     text_height = cv2.getTextSize("Test", font, font_scale, thickness)[0][1]
@@ -404,7 +414,7 @@ def main():
     global blocksize
     global audio_buffer
     global listening
-    model = Model("./vosk-model-de-0.21")  # TODO select model
+    model = STTModel("./vosk-model-small-de-0.15")  # TODO select model
     recognizer = KaldiRecognizer(model, samplerate)
 
     # Update the ip tables on Linux to ensure streaming from the Aria glasses to work properly
