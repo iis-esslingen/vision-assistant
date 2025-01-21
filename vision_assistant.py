@@ -32,9 +32,7 @@ caption_queue = queue.Queue(
 audio_enabled = False
 language = "en"  # Default language is English
 
-audio_record_queue = queue.Queue(maxsize=1)
-
-samplerate = 48000
+samplerate = 48000  # TODO adapt to config
 blocksize = 1024
 channels = 1
 
@@ -203,87 +201,11 @@ def add_caption_to_queue(caption):
     caption_queue.put(caption)
 
 
-def init_audio_output():
-    worker_thread = threading.Thread(target=play_glasses_audio, daemon=True)
-    worker_thread.start()
-
-
-# TODO not working rn
-def play_glasses_audio():
-    while True:
-        audio = audio_record_queue.get()
-        if audio is None:
-            break
-
-        try:
-            audio_segment = AudioSegment(
-                audio.tobytes(),
-                frame_rate=48000,
-                sample_width=2,
-                channels=1,
-            )
-
-            play_obj = sa.play_buffer(
-                audio_segment.raw_data,
-                num_channels=1,
-                bytes_per_sample=2,
-                sample_rate=48000,
-            )
-            play_obj.wait_done()
-        except:
-            break
-        finally:
-            audio_record_queue.task_done()
-
-
-def add_audio_to_queue(audio):
-    try:
-        audio_record_queue.get_nowait()
-    except queue.Empty:
-        pass
-    audio_record_queue.put(audio)
-
-
-def init_audio_streamer():
-    worker_thread = threading.Thread(target=stream_audio, daemon=True)
-    worker_thread.start()
-
-
-def stream_audio():
-    """
-    Startet den Audio-Stream für Ein- und Ausgabe.
-    """
-    global samplerate
-    global blocksize
-    global channels
-
-    with sd.Stream(
-        samplerate=samplerate,
-        blocksize=blocksize,
-        channels=channels,
-        dtype="float32",
-        callback=audio_callback,
-    ):
-        print("Audio-Stream läuft...")
-        threading.Event().wait()  # Blockiert, bis das Programm manuell beendet wird
-
-
-def audio_callback(indata, outdata, frames, time, status):
-    """
-    Callback für den Stream: Audio-Ein- und Ausgabe.
-    """
-    global audio_buffer
-    global listening
-    if listening:
-        audio_buffer = np.append(audio_buffer, indata.copy())
-
-
-def transcribe_audio(recognizer):
+def transcribe_audio(recognizer, audio_buffer):
     """
     Wandelt das aufgezeichnete Audio in Text um.
     """
     print("Starte Transkription...")
-    global audio_buffer
     audio_data = (audio_buffer * 32767).astype(np.int16)
     audio_data = audio_data.tobytes()
     if not recognizer.AcceptWaveform(audio_data):
@@ -313,7 +235,7 @@ class StreamingClientObserver:
     def __init__(self):
         self.images = {}
         self.audio = []
-        self.audio_timestamps = []
+        self.audio_timestamps_ns = []
 
     def on_image_received(self, image: np.array, record: ImageDataRecord):
         self.images[record.camera_id] = image
@@ -323,8 +245,8 @@ class StreamingClientObserver:
         audio_data: AudioData,
         record: AudioDataRecord,
     ):
-        self.audio += audio_data.data
-        self.audio_timestamps += record.capture_timestamps_ns
+        self.audio += audio_data.data  # TODO Only keep the latest 60sec or so
+        self.audio_timestamps_ns += record.capture_timestamps_ns
 
 
 def main():
@@ -475,8 +397,6 @@ def main():
 
     # Initialize TTS engine (macOS 'say' does not need initialization)
     init_tts_engine()
-    # init_audio_output()
-    init_audio_streamer()
 
     # Load in the VLM model
     if args.mlx:
@@ -527,20 +447,6 @@ def main():
     images = {}
     audio = []
 
-    # # Set up the plot
-    # plt.ion()  # Turn on interactive mode
-    # fig, ax = plt.subplots()
-    # a = [1, 2, 3]
-    # b = [500, 200, 400]
-    # (line,) = ax.plot(a, b)
-
-    # ax.set_title("Real-Time Plot of Glasses Audio")
-    # ax.set_xlabel("Timestamps (in s)")
-    # ax.set_ylabel("Audio")
-    # ax.grid(True)
-
-    # PLL = np.linspace(0, 48000 * 5, 48000 * 5)
-
     # Start the program loop
     try:
         while not quit_keypress():
@@ -565,34 +471,19 @@ def main():
                 images[aria.CameraId.Slam2] = slam2_image
                 del observer.images[aria.CameraId.Slam2]
 
-            # if observer.audio:
-            # audio = observer.audio
-            # audio_timestamps = observer.audio_timestamps
-            # audio_timestamps_s = [
-            #     int(timestamp / 1000000000) for timestamp in audio_timestamps
-            # ]
-            # mono_audio = audio[::7]
-            # print(
-            #     (audio_timestamps[-1] - audio_timestamps[0]) / 1000000,
-            #     " ms",
-            # )
-            # audio_arr = np.array(mono_audio, dtype=np.int32)
-            # cut_audio = audio_arr[-48000 * 3 : :]  # Only use the last 5 seconds
-            # cut_audio_timestamps = audio_timestamps_s[-48000 * 3 : :]
-            # add_audio_to_queue(cut_audio)
-            # plll = PLL[0 : len(cut_audio)]
-            # print(len(cut_audio))
-
-            # # Plot the audio data
-            # line.set_xdata(plll)
-            # line.set_ydata(cut_audio)
-            # ax.relim()  # Recalculate limits
-            # ax.autoscale_view()  # Rescale if necessary
-            # # plt.xlim(mono_audio_timestamps[0], mono_audio_timestamps[1])
-            # # plt.ylim(min(mono_audio), max(mono_audio))
-            # fig.canvas.draw()
-            # fig.canvas.flush_events()
-            # time.sleep(1)
+            # Retrieve recorded audio
+            if observer.audio:
+                audio = observer.audio
+                audio_timestamps_s = [
+                    int(timestamp / 1000000000)
+                    for timestamp in observer.audio_timestamps_ns
+                ]
+                mono_audio = audio[::7]  # TODO adapt to number of channels
+                max_sample_value = max(abs(min(mono_audio)), max(mono_audio))
+                normalized_audio = (
+                    np.array(mono_audio, dtype=np.float32)
+                    / max_sample_value  # TODO so oder durch max möglichen Wert?
+                )
 
             # Choose the image to put into the model
             try:
@@ -629,7 +520,14 @@ def main():
                 # Vision assistant mode
                 elif mode == "assisting" and waiting_for_response:
                     image = frozen_image if frozen_image is not None else latest_frame
+
+                    listened_time = time.time() - start_listening_time
+                    cut_audio = normalized_audio[int(-samplerate * listened_time) : :]
+                    latest_instruction = transcribe_audio(
+                        recognizer, cut_audio
+                    )  # TODO Fehlermeldung dass abgebrochen wird, aber führt trotzdem aus
                     prompt = assistant_prompt + latest_instruction
+
                     caption_future = executor.submit(
                         update_caption_in_background,
                         model,
@@ -695,12 +593,12 @@ def main():
                 key == ord("o") and not listening and mode == "assisting"
             ):  # Press down the key
                 print("Höre zu.")
+                start_listening_time = time.time()
                 listening = True
                 frozen_image = None
                 audio_buffer = np.array((blocksize, channels))
             elif listening and key == ord("p"):  # Release the key
                 listening = False
-                latest_instruction = transcribe_audio(recognizer)
                 waiting_for_response = True
 
             # Toggle language between German and English
