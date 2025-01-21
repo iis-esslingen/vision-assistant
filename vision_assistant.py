@@ -30,7 +30,7 @@ caption_queue = queue.Queue(
     maxsize=1
 )  # Limit the queue to 1 element to always keep the newest caption
 audio_enabled = False
-language = "en"
+language = "en"  # Default language is English
 
 audio_record_queue = queue.Queue(maxsize=1)
 
@@ -115,7 +115,11 @@ def replace_umlaute(text: str) -> str:
     Replaces German special characters with substitute characters.
     """
     return (
-        text.replace("ä", "ae").replace("ö", "oe").replace("ü", "ue").replace("ß", "ss")
+        text.replace("ä", "ae")
+        .replace("ö", "oe")
+        .replace("ü", "ue")
+        .replace("ß", "ss")
+        .replace("\n", " ")
     )
 
 
@@ -414,8 +418,11 @@ def main():
     global blocksize
     global audio_buffer
     global listening
-    model = STTModel("./vosk-model-small-de-0.15")  # TODO select model
-    recognizer = KaldiRecognizer(model, samplerate)
+    stt_model_en = STTModel("./vosk-model-small-en-us-0.15")
+    stt_model_de = STTModel("./vosk-model-small-de-0.15")
+    recognizer_en = KaldiRecognizer(stt_model_en, samplerate)
+    recognizer_de = KaldiRecognizer(stt_model_de, samplerate)
+    recognizer = recognizer_en  # Default language is English
 
     # Update the ip tables on Linux to ensure streaming from the Aria glasses to work properly
     if args.update_iptables and sys.platform.startswith("linux"):
@@ -681,10 +688,14 @@ def main():
             elif listening and key == ord("p"):  # Release the key
                 listening = False
                 latest_instruction = transcribe_audio(recognizer)
-                sd.play(audio_buffer, samplerate)
-            elif key == ord("l"):  # Toggle language between German and English˚
-                language = "de" if language == "en" else "en"
-                print("Changed language to ", language.upper())
+            elif key == ord("l"):  # Toggle language between German and English
+                if language == "en":
+                    language = "de"
+                    recognizer = recognizer_de
+                else:
+                    language = "en"
+                    recognizer = recognizer_en
+                print("Changed language to", language.upper())
             # Print help
             elif key == ord("h"):
                 display_help()
