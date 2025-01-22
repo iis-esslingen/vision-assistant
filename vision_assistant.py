@@ -33,10 +33,8 @@ audio_enabled = False
 language = "en"  # Default language is English
 
 samplerate = 48000  # TODO adapt to config
-blocksize = 1024
 channels = 1
 
-audio_buffer = np.array((blocksize, channels))
 listening = False
 
 
@@ -203,15 +201,15 @@ def add_caption_to_queue(caption):
 
 def transcribe_audio(recognizer, audio_buffer):
     """
-    Wandelt das aufgezeichnete Audio in Text um.
+    Transcribes the recorded audio into text (STT).
     """
-    print("Starte Transkription...")
+    print("Transcribing...")
     audio_data = (audio_buffer * 32767).astype(np.int16)
     audio_data = audio_data.tobytes()
     if not recognizer.AcceptWaveform(audio_data):
-        print("Transkription aufgrund eines Fehlers abgebrochen.")
+        print("Transcription error due to not accepted waveform.")
     result = json.loads(recognizer.Result()).get("text", "")
-    print("Transkription abgeschlossen.\n", result)
+    print("Transcription complete. You said:\n", result)
     return result
 
 
@@ -245,7 +243,7 @@ class StreamingClientObserver:
         audio_data: AudioData,
         record: AudioDataRecord,
     ):
-        self.audio += audio_data.data  # TODO Only keep the latest 60sec or so
+        self.audio += audio_data.data
         self.audio_timestamps_ns += record.capture_timestamps_ns
 
 
@@ -338,8 +336,6 @@ def main():
         2: aria.CameraId.Slam2,
     }
 
-    global blocksize
-    global audio_buffer
     global listening
     stt_model_en = STTModel("./vosk-model-small-en-us-0.15")
     stt_model_de = STTModel("./vosk-model-small-de-0.15")
@@ -394,6 +390,9 @@ def main():
     observer = StreamingClientObserver()
     streaming_client.set_streaming_client_observer(observer)
     streaming_client.subscribe()
+
+    if args.verbose:
+        print(f"Aria Streaming profile: {streaming_config.profile_name}")
 
     # Initialize TTS engine (macOS 'say' does not need initialization)
     init_tts_engine()
@@ -472,18 +471,11 @@ def main():
                 del observer.images[aria.CameraId.Slam2]
 
             # Retrieve recorded audio
-            if observer.audio:
+            if not listening:
+                observer.audio = []  # Clear audio data when not in use
+                observer.audio_timestamps_ns = []
+            elif observer.audio:
                 audio = observer.audio
-                audio_timestamps_s = [
-                    int(timestamp / 1000000000)
-                    for timestamp in observer.audio_timestamps_ns
-                ]
-                mono_audio = audio[::7]  # TODO adapt to number of channels
-                max_sample_value = max(abs(min(mono_audio)), max(mono_audio))
-                normalized_audio = (
-                    np.array(mono_audio, dtype=np.float32)
-                    / max_sample_value  # TODO so oder durch max möglichen Wert?
-                )
 
             # Choose the image to put into the model
             try:
@@ -521,10 +513,20 @@ def main():
                 elif mode == "assisting" and waiting_for_response:
                     image = frozen_image if frozen_image is not None else latest_frame
 
-                    listened_time = time.time() - start_listening_time
-                    cut_audio = normalized_audio[int(-samplerate * listened_time) : :]
+                    mono_audio = audio[::7]  # TODO adapt to number of channels
+                    max_sample_value = max(abs(min(mono_audio)), max(mono_audio))
+                    normalized_audio = (
+                        np.array(mono_audio, dtype=np.float32) / max_sample_value
+                    )
+                    print(
+                        f"Listened for {round(time.time() - start_listening_time, 1)}s."
+                    )
+                    audio = []  # Clear audio data after usage
+                    if args.verbose:
+                        sd.play(normalized_audio, samplerate)
+
                     latest_instruction = transcribe_audio(
-                        recognizer, cut_audio
+                        recognizer, normalized_audio
                     )  # TODO Fehlermeldung dass abgebrochen wird, aber führt trotzdem aus
                     prompt = assistant_prompt + latest_instruction
 
@@ -554,11 +556,13 @@ def main():
                 break
             elif key == ord("x"):
                 mode = "watching"
+                listening = False
                 print("Watching mode is active.")
 
             # Activate caption mode
             elif key == ord("c"):
                 mode = "captioning"
+                listening = False
 
                 # Empty the queue
                 while not caption_queue.empty():
@@ -568,6 +572,7 @@ def main():
                 print(f"Captioning mode active. Interval: {caption_interval}s.")
             elif key == ord("v"):
                 mode = "assisting"
+                listening = False
 
                 # Empty the queue
                 while not caption_queue.empty():
@@ -592,12 +597,13 @@ def main():
             elif (
                 key == ord("o") and not listening and mode == "assisting"
             ):  # Press down the key
-                print("Höre zu.")
+                print("Listening...")
                 start_listening_time = time.time()
                 listening = True
                 frozen_image = None
-                audio_buffer = np.array((blocksize, channels))
-            elif listening and key == ord("p"):  # Release the key
+            elif listening and (
+                key == ord("p") or (time.time() - start_listening_time) >= 30
+            ):  # Release the key or exceed the timer
                 listening = False
                 waiting_for_response = True
 
