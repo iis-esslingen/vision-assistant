@@ -32,8 +32,6 @@ caption_queue = queue.Queue(
 audio_enabled = False
 language = "en"  # Default language is English
 
-samplerate = 48000  # TODO adapt to config
-channels = 1
 
 listening = False
 
@@ -207,7 +205,9 @@ def transcribe_audio(recognizer, audio_buffer):
     audio_data = (audio_buffer * 32767).astype(np.int16)
     audio_data = audio_data.tobytes()
     if not recognizer.AcceptWaveform(audio_data):
-        print("Transcription error due to not accepted waveform.")
+        print(
+            "Transcription error due to not accepted waveform."
+        )  # TODO check why this is always the case
     result = json.loads(recognizer.Result()).get("text", "")
     print("Transcription complete. You said:\n", result)
     return result
@@ -329,6 +329,10 @@ def main():
     camera_index = args.camera_index
     model_name = args.model
     caption_interval = args.caption_interval
+
+    # profile18 is the only supported streaming profile with audio
+    samplerate = 48000
+    channels = 7
 
     cameras = {
         0: aria.CameraId.Rgb,
@@ -513,21 +517,26 @@ def main():
                 elif mode == "assisting" and waiting_for_response:
                     image = frozen_image if frozen_image is not None else latest_frame
 
-                    mono_audio = audio[::7]  # TODO adapt to number of channels
-                    max_sample_value = max(abs(min(mono_audio)), max(mono_audio))
-                    normalized_audio = (
-                        np.array(mono_audio, dtype=np.float32) / max_sample_value
-                    )
-                    print(
-                        f"Listened for {round(time.time() - start_listening_time, 1)}s."
-                    )
-                    audio = []  # Clear audio data after usage
-                    if args.verbose:
-                        sd.play(normalized_audio, samplerate)
+                    if audio:
+                        mono_audio = audio[::channels]
+                        print(audio)
+                        max_sample_value = max(abs(min(mono_audio)), max(mono_audio))
+                        normalized_audio = (
+                            np.array(mono_audio, dtype=np.float32) / max_sample_value
+                        )
+                        print(
+                            f"Listened for {round(time.time() - start_listening_time, 1)}s."
+                        )
+                        audio = []  # Clear audio data after usage
+                        if args.verbose:
+                            sd.play(normalized_audio, samplerate)
 
-                    latest_instruction = transcribe_audio(
-                        recognizer, normalized_audio
-                    )  # TODO Fehlermeldung dass abgebrochen wird, aber führt trotzdem aus
+                        latest_instruction = transcribe_audio(
+                            recognizer, normalized_audio
+                        )
+                    else:
+                        print("No audio detected.")
+                        latest_instruction = ""
                     prompt = assistant_prompt + latest_instruction
 
                     caption_future = executor.submit(
