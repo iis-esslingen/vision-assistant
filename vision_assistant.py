@@ -9,6 +9,7 @@ from concurrent.futures import ThreadPoolExecutor
 import argparse
 import traceback
 import numpy as np
+from scipy.signal import resample
 from PIL import Image
 import cv2
 import matplotlib.pyplot as plt
@@ -16,6 +17,7 @@ import sounddevice as sd
 from vosk import Model as STTModel, KaldiRecognizer
 from pydub import AudioSegment
 import simpleaudio as sa
+from TTS.api import TTS
 
 
 import aria.sdk as aria
@@ -75,6 +77,18 @@ def init_tts_engine():
 
 # Function to run macOS 'say' command in a separate thread and speak captions sequentially
 def speak_caption_worker():
+    tts_engine_en = TTS(
+        model_name="tts_models/en/ljspeech/glow-tts",
+        progress_bar=True,
+        gpu=False,
+    )
+
+    tts_engine_de = TTS(
+        model_name="tts_models/de/thorsten/vits",
+        progress_bar=True,
+        gpu=False,
+    )
+
     while True:
         # Get the next caption from the queue
         caption = caption_queue.get()
@@ -83,15 +97,23 @@ def speak_caption_worker():
 
         # Speak the caption using 'say' command only if audio is enabled
         if audio_enabled:
-            command = ["say"]
             if language == "de":
-                command.extend(["-v", "Anna"])
-            if caption:
-                command.extend([caption])
-                subprocess.run(command)
-
+                audio = tts_engine_de.tts(caption)
+            elif language == "en":
+                audio = tts_engine_en.tts(caption)
+            else:
+                audio = np.array((0), dtype=np.float32)
+            sd.play(audio, samplerate=22050)
+            sd.wait()
         # Mark the task as done
         caption_queue.task_done()
+
+
+def speed_up_audio(input_audio, speed_factor):
+    y = np.array(input_audio, dtype=np.float32)
+    new_length = int(len(y) / speed_factor)
+    y_resampled = resample(y, new_length)
+    return y_resampled.astype(np.float32)
 
 
 # Generate the response of the model based on the frame and prompt
@@ -111,8 +133,11 @@ def replace_umlaute(text: str) -> str:
     """
     return (
         text.replace("ä", "ae")
+        .replace("Ä", "Ae")
         .replace("ö", "oe")
+        .replace("Ö", "Oe")
         .replace("ü", "ue")
+        .replace("Ü", "Ue")
         .replace("ß", "ss")
         .replace("\n", " ")
     )
@@ -519,7 +544,6 @@ def main():
 
                     if audio:
                         mono_audio = audio[::channels]
-                        print(audio)
                         max_sample_value = max(abs(min(mono_audio)), max(mono_audio))
                         normalized_audio = (
                             np.array(mono_audio, dtype=np.float32) / max_sample_value
