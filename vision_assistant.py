@@ -28,10 +28,11 @@ os.environ["TOKENIZERS_PARALLELISM"] = "false"
 caption_queue = queue.Queue(
     maxsize=1
 )  # Limit the queue to 1 element to always keep the newest caption
+caption_lock = False
+audio_stopped = False
+
 audio_enabled = False
 language = "en"  # Default language is English
-
-
 listening = False
 
 
@@ -74,6 +75,8 @@ def init_tts_engine():
 
 # Function to run macOS 'say' command in a separate thread and speak captions sequentially
 def speak_caption_worker():
+    global audio_stopped
+
     tts_engine_en = TTS(
         model_name="tts_models/en/ljspeech/glow-tts",
         progress_bar=True,
@@ -91,6 +94,7 @@ def speak_caption_worker():
         caption = caption_queue.get()
         if caption is None:
             break  # Exit the worker thread
+        audio_stopped = False
 
         # Speak the caption using 'say' command only if audio is enabled
         if audio_enabled:
@@ -100,8 +104,12 @@ def speak_caption_worker():
                 audio = tts_engine_en.tts(caption)
             else:
                 audio = np.array((0), dtype=np.float32)
-            sd.play(audio, samplerate=22050)
-            sd.wait()
+
+            # Play the audio as long as it is not stopped elsewhere
+            if not audio_stopped:
+                sd.play(audio, samplerate=22050)
+                sd.wait()
+
         # Mark the task as done
         caption_queue.task_done()
 
@@ -211,12 +219,24 @@ def add_caption_to_frame(
 
 # Function to add a new caption to the queue (replace the old one if the queue is full)
 def add_caption_to_queue(caption):
-    if not caption_queue.empty():
-        try:
-            caption_queue.get_nowait()  # Remove the oldest caption
-        except queue.Empty:
-            pass  # In case there is no caption, do nothing
+    try:
+        caption_queue.get_nowait()  # Remove the oldest caption
+    except queue.Empty:
+        pass  # In case there is no caption, do nothing
     caption_queue.put(caption)
+
+
+def empty_and_lock_queue():
+    global caption_lock
+    caption_lock = True
+    while not caption_queue.empty():
+        caption_queue.get_nowait()
+
+
+def stop_audio():
+    global audio_stopped
+    audio_stopped = True
+    sd.stop()
 
 
 def transcribe_audio(recognizer, audio_buffer):
@@ -351,6 +371,7 @@ def main():
     camera_index = args.camera_index
     model_name = args.model
     caption_interval = args.caption_interval
+    global caption_lock
 
     # profile18 is the only supported streaming profile with audio
     samplerate = 48000
@@ -464,8 +485,9 @@ def main():
         nonlocal latest_caption
         prompt = prompt
         response = generate_caption(model, frame, prompt)
-        latest_caption = response
-        add_caption_to_queue(response)
+        if not caption_lock:
+            latest_caption = response
+            add_caption_to_queue(response)
 
     last_caption_time = time.time()  # Track the last time a caption was updated
 
@@ -524,6 +546,7 @@ def main():
                 if mode == "captioning" and (
                     current_time - last_caption_time >= caption_interval
                 ):
+                    caption_lock = False
                     caption_future = executor.submit(
                         update_caption_in_background,
                         model,
@@ -531,7 +554,7 @@ def main():
                         captioning_prompt,
                     )
                     print(
-                        f"Caption done in {(current_time - last_caption_time):4.2} seconds."
+                        f"Caption done in {(current_time - last_caption_time):.3f} seconds."
                     )
                     last_caption_time = current_time
 
@@ -540,7 +563,7 @@ def main():
                     image = frozen_image if frozen_image is not None else latest_frame
 
                     if audio:
-                        mono_audio = audio[::channels]
+                        mono_audio = audio[::channels]  # TODO use stereo or other mic?
                         max_sample_value = max(abs(min(mono_audio)), max(mono_audio))
                         normalized_audio = (
                             np.array(mono_audio, dtype=np.float32) / max_sample_value
@@ -584,29 +607,31 @@ def main():
             if key == ord("q"):
                 print("Exiting the loop.")
                 break
+
             elif key == ord("x"):
                 mode = "watching"
                 listening = False
                 print("Watching mode is active.")
+                empty_and_lock_queue()
+                stop_audio()
 
             # Activate caption mode
             elif key == ord("c"):
                 mode = "captioning"
                 listening = False
+                empty_and_lock_queue()
+                stop_audio()
 
-                # Empty the queue
-                while not caption_queue.empty():
-                    caption_queue.get_nowait()
-
+                last_caption_time = time.time()
                 latest_caption = "No caption available"
                 print(f"Captioning mode active. Interval: {caption_interval}s.")
+
+            # Activate assisting mode
             elif key == ord("v"):
                 mode = "assisting"
                 listening = False
-
-                # Empty the queue
-                while not caption_queue.empty():
-                    caption_queue.get_nowait()
+                empty_and_lock_queue()
+                stop_audio()
 
                 latest_caption = "Press 'o' and ask a question. Press 'p' to stop."
                 print("Assisting mode is active")
@@ -614,6 +639,7 @@ def main():
             # Toggle audio on/off
             elif key == ord("a"):
                 audio_enabled = not audio_enabled
+                stop_audio()
                 print(f"Audio {'enabled' if audio_enabled else 'disabled'}.")
 
             # Switch camera
@@ -627,6 +653,8 @@ def main():
             elif (
                 key == ord("o") and not listening and mode == "assisting"
             ):  # Press down the key
+                empty_and_lock_queue()
+                stop_audio()
                 print("Listening...")
                 start_listening_time = time.time()
                 listening = True
@@ -634,11 +662,14 @@ def main():
             elif listening and (
                 key == ord("p") or (time.time() - start_listening_time) >= 30
             ):  # Release the key or exceed the timer
+                caption_lock = False
                 listening = False
                 waiting_for_response = True
 
             # Toggle language between German and English
             elif key == ord("l"):
+                empty_and_lock_queue()
+                stop_audio()
                 if language == "en":
                     language = "de"
                     recognizer = recognizer_de
