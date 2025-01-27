@@ -37,7 +37,7 @@ def create_venv():
         # Create the virtual environment
         subprocess.check_call([python_executable, "-m", "venv", venv_dir])
 
-    print(f"Virtual environment '{venv_dir}' is ready.")
+    print(f"Virtual environment '{venv_dir}' is ready\n")
 
 
 def install_requirements():
@@ -59,7 +59,7 @@ def install_requirements():
             stdout=devnull,
             stderr=devnull,
         )
-    print("All requirements are now installed.")
+    print("All requirements are now installed.\n")
 
 
 def main():

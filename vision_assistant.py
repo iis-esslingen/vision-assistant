@@ -12,11 +12,8 @@ import numpy as np
 from scipy.signal import resample
 from PIL import Image
 import cv2
-import matplotlib.pyplot as plt
 import sounddevice as sd
 from vosk import Model as STTModel, KaldiRecognizer
-from pydub import AudioSegment
-import simpleaudio as sa
 from TTS.api import TTS
 
 
