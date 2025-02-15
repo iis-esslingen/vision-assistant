@@ -122,12 +122,12 @@ def speed_up_audio(input_audio, speed_factor):
 
 
 # Generate the response of the model based on the frame and prompt
-def generate_caption(model, frame, prompt):
+def ask(model, frame, prompt):
     # Convert OpenCV frame to PIL Image for the VLM
     pil_image = Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
 
     # Generate caption
-    result = model.generate_caption(pil_image, prompt=prompt)
+    result = model.ask(pil_image, prompt=prompt)
     return result
 
 
@@ -384,8 +384,8 @@ def main():
     }
 
     global listening
-    stt_model_en = STTModel("./vosk-model-small-en-us-0.15")
-    stt_model_de = STTModel("./vosk-model-small-de-0.15")
+    stt_model_en = STTModel("./vosk-model-en-us-0.22")
+    stt_model_de = STTModel("./vosk-model-de-0.21")
     recognizer_en = KaldiRecognizer(stt_model_en, samplerate)
     recognizer_de = KaldiRecognizer(stt_model_de, samplerate)
     recognizer = recognizer_en  # Default language is English
@@ -470,8 +470,8 @@ def main():
 
     captioning_prompt_en = "Describe this image in a short single sentence. Please do not exceed 15 words in total."
     captioning_prompt_de = "Beschreibe dieses Bild in einem einzigen kurzen Satz. Verwende auf keinen Fall mehr als insgesamt 15 Worte in deiner Antwort."
-    assistant_prompt_en = "You are assisting a visually impaired person. Their question and the image they 'see' are provided. Answer concisely to directly address their question based on the visual and contextual input. Please do not exceed 25 words in total. Here comes the user's request: "
-    assistant_prompt_de = "Du unterstützt eine sehbehinderte Person. Ihre Frage und das Bild, das sie 'sieht', werden bereitgestellt. Antworte präzise und gehe direkt auf die Frage ein, basierend auf den visuellen und kontextuellen Eingaben. Nutze auf keinen Fall mehr als 25 Worte. Hier ist die Frage des Nutzers: "
+    assistant_prompt_en = "I am a visually impaired person and need assistance. I am wearing glasses which capture the image that is beeing provided. Please answer concisely to directly address my question based on the visual and contextual input. Please do not exceed 25 words in total. Please do not mention my visual impairment at all. "
+    assistant_prompt_de = "Ich bin eine sehbehinderte Person und benötige Hilfe. Ich trage eine Brille, die das bereitgestellte Bild einfängt. Bitte antworte präzise, um meine Frage anhand der visuellen und textuellen Eingaben direkt zu beantworten. Bitte nutze nicht mehr als 25 Worte für deine Antwort. Erwähne unter keinen Umständen meine Sehbehinderung. "
     captioning_prompt = captioning_prompt_en
     assistant_prompt = assistant_prompt_en
 
@@ -483,8 +483,7 @@ def main():
 
     def update_caption_in_background(model, frame, prompt):
         nonlocal latest_caption
-        prompt = prompt
-        response = generate_caption(model, frame, prompt)
+        response = ask(model, frame, prompt)
         if not caption_lock:
             latest_caption = response
             add_caption_to_queue(response)
@@ -546,6 +545,7 @@ def main():
                 if mode == "captioning" and (
                     current_time - last_caption_time >= caption_interval
                 ):
+                    model.conversation = []  # Delete chat history
                     caption_lock = False
                     caption_future = executor.submit(
                         update_caption_in_background,
@@ -581,13 +581,12 @@ def main():
                     else:
                         print("No audio detected.")
                         latest_instruction = ""
-                    prompt = assistant_prompt + latest_instruction
 
                     caption_future = executor.submit(
                         update_caption_in_background,
                         model,
                         image,
-                        prompt,
+                        latest_instruction,
                     )
                     waiting_for_response = False
 
@@ -621,6 +620,7 @@ def main():
                 listening = False
                 empty_and_lock_queue()
                 stop_audio()
+                model.conversation = []  # New chat
 
                 last_caption_time = time.time()
                 latest_caption = "No caption available"
@@ -632,6 +632,10 @@ def main():
                 listening = False
                 empty_and_lock_queue()
                 stop_audio()
+                model.conversation = []  # New chat
+                model.conversation.append(
+                    {"role": "user", "content": assistant_prompt}
+                )  # Define role
 
                 latest_caption = "Press 'o' and ask a question. Press 'p' to stop."
                 print("Assisting mode is active")

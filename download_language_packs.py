@@ -7,8 +7,8 @@ from TTS.api import TTS
 def download_stt_packs():
 
     urls = [
-        "https://alphacephei.com/vosk/models/vosk-model-small-en-us-0.15.zip",
-        "https://alphacephei.com/vosk/models/vosk-model-small-de-0.15.zip",
+        "https://alphacephei.com/vosk/models/vosk-model-en-us-0.22.zip",
+        "https://alphacephei.com/vosk/models/vosk-model-de-0.21.zip",
     ]
     for url in urls:
         package_name = url.split("/")[-1].removesuffix(".zip")
