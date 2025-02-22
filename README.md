@@ -3,7 +3,7 @@ Get the world around you described while wearing the Aria glasses.
 
 
 # Requirements
-Python >= 3.11
+Python == 3.11
 
 
 # Get started
