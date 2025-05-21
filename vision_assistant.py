@@ -33,7 +33,14 @@ audio_stopped = False
 
 audio_enabled = False
 language = "en"  # Default language is English
-listening = False
+from queue import Queue
+
+audio_queue = Queue(maxsize=10)
+listening_keyword = True
+waiting_for_response = False
+
+
+
 
 
 def update_iptables() -> None:
@@ -269,6 +276,61 @@ def display_help():
     print("'1' : Switch the camera.")
     print("'h' : Display this help message.\n")
 
+def keyword_listener():
+    import traceback
+    global listening, listening_keyword, mode, waiting_for_response
+
+    max_buffer_samples = 48000 * 2  # 2 seconds of audio
+    rolling_audio = []
+
+    GRAMMAR = '["vision", "assistant", "computer", "please", "obligation", "misunderstanding", "mindfullness"]'
+    stt_model_en_small = STTModel("./vosk-model-small-en-us-0.15")
+    kws_recognizer = KaldiRecognizer(stt_model_en_small, 48000, GRAMMAR)
+
+    print("Starting keyword listener...")
+    
+    while True:
+        if listening_keyword:
+            print("Listening for keyword...")
+            try:
+                mono_audio = audio_queue.get(timeout=1) 
+                rolling_audio.extend(mono_audio)
+
+                if len(rolling_audio) > max_buffer_samples:
+                        rolling_audio = rolling_audio[-max_buffer_samples:] #maybe unnecessary
+
+                max_sample_value = max(abs(min(rolling_audio)), max(rolling_audio))
+                if max_sample_value == 0:
+                    print("Division by zero error in normalization. Skipping this chunk.")
+                    continue
+
+                normalized_audio = (
+                    np.array(rolling_audio, dtype=np.float32) / max_sample_value
+                )
+                audio_data = (normalized_audio * 32767).astype(np.int16)
+
+                if kws_recognizer.AcceptWaveform(audio_data.tobytes()):
+                    final_result = json.loads(kws_recognizer.Result())
+                    text = final_result.get("text", "").lower()
+
+                    if "computer" in text:
+                        print("🟢 Keyword 'computer' detected! Switching to listening mode...")
+                        print("🟢 Keyword 'computer' detected! Switching to listening mode...")
+                        #listening = True
+                        #mode = "assisting"
+                        #rolling_audio.clear()
+                        #waiting_for_response = True
+                        #listening_keyword = False
+
+            except Exception as e:
+                print("🔴 Exception in keyword_listener:")
+                traceback.print_exc()
+
+    
+
+
+
+
 
 # Class for the stream observer
 class StreamingClientObserver:
@@ -375,6 +437,7 @@ def main():
 
     # profile18 is the only supported streaming profile with audio
     samplerate = 48000
+    global channels
     channels = 7
 
     cameras = {
@@ -383,12 +446,21 @@ def main():
         2: aria.CameraId.Slam2,
     }
 
-    global listening
+
     stt_model_en = STTModel("./vosk-model-en-us-0.22")
     stt_model_de = STTModel("./vosk-model-de-0.21")
     recognizer_en = KaldiRecognizer(stt_model_en, samplerate)
     recognizer_de = KaldiRecognizer(stt_model_de, samplerate)
     recognizer = recognizer_en  # Default language is English
+
+
+    global listening
+    listening = False
+
+   
+
+    
+
 
     # Update the ip tables on Linux to ensure streaming from the Aria glasses to work properly
     if args.update_iptables and sys.platform.startswith("linux"):
@@ -434,6 +506,7 @@ def main():
     print(f"Streaming state: {streaming_state}")
 
     # Create and attach observer
+    global observer
     observer = StreamingClientObserver()
     streaming_client.set_streaming_client_observer(observer)
     streaming_client.subscribe()
@@ -443,6 +516,10 @@ def main():
 
     # Initialize TTS engine (macOS 'say' does not need initialization)
     init_tts_engine()
+
+    #KWS
+    kws_thread = threading.Thread(target=keyword_listener, daemon=True)
+    kws_thread.start()  
 
     # Load in the VLM model
     if args.mlx:
@@ -461,6 +538,7 @@ def main():
         model = ollama_ifc.OllamaVLM(model_name)
         print(f"Using model: {model_name}")
 
+    global mode
     mode = "watching"
     global audio_enabled
     global language
@@ -479,7 +557,7 @@ def main():
     latest_caption = "No caption available"
     executor = ThreadPoolExecutor(max_workers=1)
     caption_future = None
-    waiting_for_response = False
+    
 
     def update_caption_in_background(model, frame, prompt):
         nonlocal latest_caption
@@ -492,10 +570,22 @@ def main():
 
     images = {}
     audio = []
+    global waiting_for_response
 
     # Start the program loop
     try:
         while not quit_keypress():
+
+            if observer.audio:
+                new_audio = observer.audio
+                mono_audio = new_audio[::channels]
+
+            try:
+                audio_queue.put_nowait(mono_audio)
+            except Full:
+                print("⚠️ Audio queue is full. Dropping frame.")
+            
+            
             # Retrieve the current RGB image
             if aria.CameraId.Rgb in observer.images:
                 rgb_image = np.rot90(observer.images[aria.CameraId.Rgb], -1)
@@ -517,12 +607,15 @@ def main():
                 images[aria.CameraId.Slam2] = slam2_image
                 del observer.images[aria.CameraId.Slam2]
 
+            
             # Retrieve recorded audio
             if not listening:
                 observer.audio = []  # Clear audio data when not in use
                 observer.audio_timestamps_ns = []
             elif observer.audio:
                 audio = observer.audio
+
+            
 
             # Choose the image to put into the model
             try:
@@ -558,8 +651,17 @@ def main():
                     )
                     last_caption_time = current_time
 
+
+                
+
+
+
+
+
+
                 # Vision assistant mode
                 elif mode == "assisting" and waiting_for_response:
+                   
                     image = frozen_image if frozen_image is not None else latest_frame
 
                     if audio:
@@ -568,9 +670,12 @@ def main():
                         normalized_audio = (
                             np.array(mono_audio, dtype=np.float32) / max_sample_value
                         )
-                        print(
-                            f"Listened for {round(time.time() - start_listening_time, 1)}s."
-                        )
+                        
+                    
+                        
+                        #print(
+                        #    f"Listened for {round(time.time() - start_listening_time, 1)}s."
+                        #)
                         audio = []  # Clear audio data after usage
                         if args.verbose:
                             sd.play(normalized_audio, samplerate)
@@ -664,7 +769,7 @@ def main():
                 listening = True
                 frozen_image = None
             elif listening and (
-                key == ord("p") or (time.time() - start_listening_time) >= 30
+                key == ord("p") #or (time.time() - start_listening_time) >= 30  #rethink this
             ):  # Release the key or exceed the timer
                 caption_lock = False
                 listening = False
