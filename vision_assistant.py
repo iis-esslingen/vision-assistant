@@ -30,6 +30,22 @@ from projectaria_tools.core.sensor_data import (
     AudioDataRecord,
 )
 
+
+class LatestCaptionBuffer:
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.caption = None
+
+    def set(self, text):
+        with self.lock:
+            self.caption = text
+
+    def get(self):
+        with self.lock:
+            return self.caption
+        
+
+
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 caption_queue = queue.Queue(maxsize=1)  # Limit the queue to 1 element to always keep the newest caption
 caption_lock = False
@@ -38,13 +54,16 @@ audio_stopped = False
 audio_enabled = False
 
 audio_queue = deque(maxlen=10)  # keep latest 10 chunks
-assistant_queue = queue.Queue()
+assistant_queue = queue.Queue() #move tthis to the VAI object perhaps
+
+latest_caption_buffer = LatestCaptionBuffer()
 
 
 
 
 
 def assistant_worker():
+    
     print("Assistant worker thread started")
     while True:
         item = assistant_queue.get()
@@ -62,8 +81,9 @@ def assistant_worker():
             observer=observer,
             args=args,
             samplerate=samplerate,
-            channels=channels
+            channels=channels,
         )
+        
         
         vision_assistant_interaction.run(image)
         
@@ -303,6 +323,10 @@ def add_caption_to_frame(
         return frame  # No caption to add
 
     img_height, img_width, _ = frame.shape
+    caption = latest_caption_buffer.get()
+    if not caption:
+        return frame
+    
     caption = replace_umlaute(caption)
     lines = wrap_text(caption, font, font_scale, thickness, img_width)
 
@@ -471,7 +495,6 @@ def keyword_listener(response_processor): # TODO: refactor further
     keyword_audio = []
     
     kws_recognizer = create_kws_model()
-    last_switch_time = 0
 
     print("[KWS-LISTENER-THREAD] Starting keyword listener...")
 
@@ -568,7 +591,8 @@ class ResponseStateProcessor:
         "de": "Beschreibe dieses Bild in einem einzigen kurzen Satz. Verwende auf keinen Fall mehr als insgesamt 15 Worte in deiner Antwort."
     }
     assistant_prompt = {
-        "en": "I am a visually impaired person and need assistance. I am wearing glasses which capture the image that is being provided. Please answer concisely to directly address my question based on the visual and contextual input. Do not exceed 25 words in total. Do not mention my visual impairment or the camera's fisheye lens. This is my question:\n",
+        #"en": "IMPORTANT: Your response must be no more than 40 words. Do not exceed this limit. I am a visually impaired person and need assistance navigating my environment. I am wearing glasses that capture this image from my perspective. Please provide detailed spatial guidance including: \n - distances to objects,\n - potential obstacles or hazards,\n - directional instructions (left/right/forward),\n - and step-by-step navigation advice.\n Be specific about what I should do next. Do not mention my visual impairment or camera details. My question is:\n",
+        "en": "I am a visually impaired person and need assistance. I am wearing glasses which capture the image that is being provided. Please answer concisely to directly address my question based on the visual and contextual input. Do not exceed 25 words in total. Do not mention my visual impairment or the camera's fisheye lens. My question is:\n",
         "de": "Ich bin eine sehbehinderte Person und benötige Hilfe. Ich trage eine Brille, die das bereitgestellte Bild einfängt. Bitte antworte präzise, um meine Frage anhand der visuellen und textuellen Eingaben direkt zu beantworten. Bitte nutze nicht mehr als 25 Worte für deine Antwort. Erwähne unter keinen Umständen meine Sehbehinderung. Meine Frage lautet:\n"
     }
 
@@ -608,9 +632,12 @@ class ResponseStateProcessor:
         
 
         print(f"DEBUG: language={lang}")
-        print("DEBUG: full_prompt =", repr(full_prompt))
+        print("DEBUG: full_prompt =", full_prompt)
 
         pil_image = Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
+        #debug image
+        pil_image.save("prompt_debug_image.jpg")  # Save for debugging
+
         result = self.model.ask(pil_image, prompt=full_prompt)
         return result
 
@@ -640,6 +667,8 @@ class ResponseStateProcessor:
         """Main method that calls the model and handles the response"""
         print("🟡 Processing frame started")
         print("🟡 Processing frame started")
+        # save frame for debugging
+        cv2.imwrite("debug_frame.jpg", frame)  # Save the frame for debugging
         print("With prompt: and language:", prompt, language)
 
         try:
@@ -677,7 +706,6 @@ class ResponseStateProcessor:
 
 def init_aria(args):
 
-    # Set Aria log level to debug if verbosity is desired
     if args.verbose:
         aria.set_log_level(aria.Level.Debug)
     else:
@@ -797,6 +825,9 @@ def parse_args():
     return parser.parse_args()
 
 
+
+
+
 class VisionAssistantInteraction:
     def __init__(self, response_processor, assistant_executor, recognizer_manager, observer, args, samplerate, channels):
         self.response_processor = response_processor
@@ -806,6 +837,9 @@ class VisionAssistantInteraction:
         self.args = args
         self.samplerate = samplerate
         self.channels = channels
+
+        
+
     
     def run(self, image):
         print("Keyword COMPUTER detected, please speak your prompt")
@@ -816,7 +850,6 @@ class VisionAssistantInteraction:
         if audio:
             print(f"Recorded {len(audio)} samples of audio.")
             norm_audio, latest_instruction = self.transcribe_audio(audio)
-            #self.response_processor.enable_keyword_listening()
             
             if self.args.verbose:
                 print("Audio data received, playing back prompt audio...")
@@ -907,10 +940,39 @@ class VisionAssistantInteraction:
             self.response_processor.enqueue_speech("Processing", language="en")
         elif self.response_processor.language == "de":
             self.response_processor.enqueue_speech("In Bearbeitung", language="de")
+    
 
 
+    
 
-# Class for the stream observer
+def caption_worker(response_processor):
+    print("[CaptionWorker] 🟢 Caption worker thread started")
+
+    while True:
+        try:
+            item = caption_queue.get()
+            if item is None:
+                print("[CaptionWorker] 🔴 Received shutdown signal")
+                break
+
+            frame, language = item
+            print(f"[CaptionWorker] 🟡 Received item — lang: {language}")
+
+            prompt = response_processor.captioning_prompt.get(language, response_processor.captioning_prompt["en"])
+            print(f"[CaptionWorker] 🟡 Using prompt: {prompt}")
+
+            caption = response_processor.process_frame(frame=frame, language=language, prompt=prompt, mode="captioning")
+            print(f"[CaptionWorker] 🟢 Caption generated: {caption}")
+
+            if caption:
+                latest_caption_buffer.set(caption)
+
+            caption_queue.task_done()
+
+        except Exception as e:
+            print(f"[CaptionWorker] 🔴 Exception: {e}")
+
+
 class StreamingClientObserver:
     def __init__(self):
         self.images = {}
@@ -999,19 +1061,17 @@ def main():
     latest_frame = None
     frozen_image = None
 
-    captioning_prompt_en = "Describe this image in a short single sentence. Please do not exceed 15 words in total."
-    captioning_prompt_de = "Beschreibe dieses Bild in einem einzigen kurzen Satz. Verwende auf keinen Fall mehr als insgesamt 15 Worte in deiner Antwort."
-    assistant_prompt_en = "I am a visually impaired person and need assistance. I am wearing glasses which capture the image that is being provided. Please answer concisely to directly address my question based on the visual and contextual input. Do not exceed 25 words in total. Do not mention my visual impairment or the camera's fisheye lens. This is my question:\n"
-    assistant_prompt_de = "Ich bin eine sehbehinderte Person und benötige Hilfe. Ich trage eine Brille, die das bereitgestellte Bild einfängt. Bitte antworte präzise, um meine Frage anhand der visuellen und textuellen Eingaben direkt zu beantworten. Bitte nutze nicht mehr als 25 Worte für deine Antwort. Erwähne unter keinen Umständen meine Sehbehinderung. \n"
-    captioning_prompt = captioning_prompt_en
-    assistant_prompt = assistant_prompt_en
+
+    
+
+
 
     #latest_instruction = ""
     latest_caption = "No caption available"
     caption_executor = ThreadPoolExecutor(max_workers=1)
     assistant_executor = ThreadPoolExecutor(max_workers=1)
 
-    caption_future = None
+    threading.Thread(target=caption_worker, args=(response_processor,), daemon=True).start()
 
    
     
@@ -1048,24 +1108,17 @@ def main():
                 mono_audio = new_audio[::channels]
                 audio_queue.append(mono_audio)
 
-            
-
-            
             # Choose the image to put into the model
             try:
                 latest_frame = images[cameras[camera_index]]
             except:
-                print(
-                    f"No {cameras[camera_index]} image detected. {len(observer.images) = }"
-                )
+                print(f"No {cameras[camera_index]} image detected. {len(observer.images) = }")
                 continue
 
-            # For the assisting mode, get the image at the moment the user starts speaking
             if frozen_image is None:
                 frozen_image = latest_frame
 
             # Update caption based on mode
-            current_time = time.time()
             if response_processor.mode == "assisting" and not response_processor.assistant_processing:
                     
                 assistant_queue.put((
@@ -1089,37 +1142,23 @@ def main():
 
                 # Captioning mode
             elif response_processor.mode == "captioning" and not response_processor.assistant_processing:
-                    print("KWS JUMPS HERE FIRST")
-                    print("KWS JUMPS HERE FIRST")
-                    print("KWS JUMPS HERE FIRST")
-                    
-                    #response_processor.model.conversation = []  # New chat
-                    #model.conversation = []  # Delete chat history
-                    caption_lock = False
-                    
-                    
-                    caption_future = caption_executor.submit(response_processor.process_frame, frame=latest_frame, language=response_processor.language, prompt=response_processor.captioning_prompt(response_processor.language)) #processor should know if captioning_prompt or assistant_prompt is used
-                    print(
-                        f"Caption done in {(current_time - last_caption_time):.3f} seconds."
-                    )
-                    last_caption_time = current_time
-
-
                 
+                try:
+                    caption_queue.put_nowait((latest_frame, response_processor.language))
+                except queue.Full:
+                    print("[CaptionQueue] Queue full — skipping frame")
 
-
-                # Vision assistant mode
-                
-                    #vision assistant mode ends here
-
-
-    
             
-            frame_with_caption = (add_caption_to_frame(latest_frame)
-            if response_processor.mode == "captioning"
-            else latest_frame
-            )
+            
 
+            
+            
+            
+            
+            frame_with_caption = (
+                add_caption_to_frame(latest_frame)
+                if response_processor.mode == "captioning"
+                else latest_frame)
 
 
             # Display the stream
@@ -1134,17 +1173,7 @@ def main():
 
             
 
-            # Activate caption mode
-            elif response_processor.mode == "captioning":
-                listening = False
-                #empty_and_lock_queue()
-                #stop_audio()
-                model.conversation = []  # New chat
-
-                last_caption_time = time.time()
-                latest_caption = "No caption available"
-               # print(f"Captioning mode active. Interval: {caption_interval}s.")
-
+            
             # Activate assisting mode
             elif key == ord("v"): # if mode == "assisting"
                 #response_processor.mode == "captioning"
@@ -1189,7 +1218,11 @@ def main():
         cv2.destroyAllWindows()
 
         assistant_queue.put(None)
+
+
         assistant_worker_thread.join()
+        caption_queue.put((None, None))  # to break caption_worker
+
 
         caption_executor.shutdown()
         assistant_executor.shutdown()
