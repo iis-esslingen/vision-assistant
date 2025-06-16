@@ -142,7 +142,7 @@ def create_kws_model():
 
 def keyword_listener(event_queue, keyword_listening_flag, global_running_flag, cooldown_seconds=2):
     """
-    Listens for wake-words and pushes Events onto event_queue.
+    Listens for keywords and pushes Events onto event_queue.
     - event_queue: queue.Queue[Event]
     - audio_queue: deque of raw audio chunks from ARIA
     - keyword_listening_flag: multiprocessing.Value('b', True/False)
@@ -150,27 +150,30 @@ def keyword_listener(event_queue, keyword_listening_flag, global_running_flag, c
     keywords = ['computer', 'caption', 'guiding', 'watching', 'language']
     recognizer = create_kws_model()
     last_switch = 0
+    keyword_audio = []
 
     print("[KWS] Starting keyword listener…")
     while global_running_flag.value == True:
         # honor the shared flag to pause KWS when, e.g., recording for assistant
         if not keyword_listening_flag.value:
-            print("Sleeping")
+            #print("[KWS] SLEEPING DUE TO DISABLED keyword_listening_flag.value")
             time.sleep(0.1)
             continue
 
-        # 2) Grab one buffer from the deque, if available
         try:
-            buf = audio_queue.popleft()
+            buffer = audio_queue.popleft()
+            keyword_audio.extend(buffer)
         except IndexError:
-            # nothing to process yet
-            print("Nothing to process yet!!")
+            print("INDEX ERROR KWS THREAD")
             time.sleep(0.05)
             continue
 
+        if len(keyword_audio) > 24000:
+            keyword_audio = keyword_audio[-24000:]
+
         # 3) Normalize and run KWS
         try:
-            audio_buffer = normalize_audio_buffer(buf)
+            audio_buffer = normalize_audio_buffer(keyword_audio)
         except Exception:
             print("[KWS] 🔴 Error normalizing audio buffer")
             traceback.print_exc()
@@ -179,7 +182,7 @@ def keyword_listener(event_queue, keyword_listening_flag, global_running_flag, c
 
         # feed into recognizer
         if not recognizer.AcceptWaveform(audio_buffer.tobytes()):
-            print("Sleeping due to recognizer not AcceptWaveForm")
+            #print("Sleeping due to recognizer not AcceptWaveForm")
             time.sleep(0.02)
             continue
 
@@ -428,16 +431,17 @@ class VLMService:
         print("Init VLMSeervice!!")
         self.model = model
         self.captioning_prompt = {
-            "en": "Describe this image in a short single sentence. Please do not exceed 15 words in total.",
-            "de": "Beschreibe dieses Bild in einem einzigen kurzen Satz. Verwende auf keinen Fall mehr als insgesamt 15 Worte in deiner Antwort."
+        "en": "Describe this image in a short single sentence. Please do not exceed 15 words in total.",
+        "de": "Beschreibe dieses Bild in einem einzigen kurzen Satz. Verwende auf keinen Fall mehr als insgesamt 15 Worte in deiner Antwort."
         }
         self.assistant_prompt = {
-            "en": "I am a visually impaired person and need assistance. … My question is:\n",
-            "de": "Ich bin eine sehbehinderte Person und benötige Hilfe. … Meine Frage lautet:\n"
-        }
+        "en": "I am a visually impaired person and need assistance. I am wearing glasses which capture the image that is being provided. Please answer concisely to directly address my question based on the visual and contextual input. Do not exceed 25 words in total. Do not mention my visual impairment or the camera's fisheye lens. My question is:\n",
+        "de": "Ich bin eine sehbehinderte Person und benötige Hilfe. Ich trage eine Brille, die das bereitgestellte Bild einfängt. Bitte antworte präzise, um meine Frage anhand der visuellen und textuellen Eingaben direkt zu beantworten. Bitte nutze nicht mehr als 25 Worte für deine Antwort. Erwähne unter keinen Umständen meine Sehbehinderung. Meine Frage lautet:\n"
+    }
         self.guiding_prompt = {
-            "en": "You are a guide. … Identify obstacles, distances, directions. My question is:\n",
-            "de": "Du bist ein Guide. … Erkenne Hindernisse, Entfernungen, Richtungen. Meine Frage lautet:\n"
+            "en": "IMPORTANT: Your response must be no more than 25 words. Do not exceed this limit. I am a visually impaired person and need assistance navigating my environment. I am wearing glasses that capture this image from my perspective. Please provide detailed spatial guidance including: \n - distances to objects,\n - potential obstacles or hazards,\n - directional instructions (left/right/forward),\n - and step-by-step navigation advice.\n Be specific about what I should do next. Do not mention my visual impairment or camera details",
+            #rewrite the prompts as you are [ROLE] ...
+            "de": "WICHTIG: Deine Antwort darf maximal 25 Wörter haben. Ich benötige Hilfe bei der Navigation. Ich trage eine Brille mit Kamera. Gib mir räumliche Orientierung: Entfernungen, Hindernisse, Richtungsangaben (links/rechts/vorwärts) und konkrete nächste Schritte. Erwähne nicht meine Sehbehinderung. Meine Frage:\n"
         }
 
     def _get_prefix(self, mode: str, lang: str) -> str:
@@ -455,6 +459,7 @@ class VLMService:
         """
         prefix = self._get_prefix(mode, lang)
         full_prompt = prefix + (text_prompt or "")
+        print("[VLM SERVICE] - passing full prompt into vlm: ", full_prompt)
         # convert OpenCV frame to PIL if your model needs
         pil = Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
         return self.model.ask(pil, prompt=full_prompt)
@@ -575,22 +580,37 @@ class AssistantHandler(ModeHandler):
         self._latest_frame = None
         self.kws_flag = keyword_listening_flag
         self.annotation_queue = annotation_queue
+        self.samplerate = 48000
+        self.channels = 7
 
+        # STT Models
         self._model_paths = {
             "en": "./vosk-model-en-us-0.22",
             "de": "./vosk-model-de-0.21"
         }
-        self._recognizers = None
+
+        self.recognizers = self._load_recognizers()
 
     
-    @property
-    def recognizers(self):
-        if self._recognizers is None:
-            self._recognizers = {
-                lang: KaldiRecognizer(STTModel(path), self.samplerate)
-                for lang, path in self._model_paths.items()
-            }
-        return self._recognizers
+    def _load_recognizers(self) -> dict[str, KaldiRecognizer]:
+        """
+        Load STT models and wrap them in recognizers.
+        Returns a dict mapping language codes to KaldiRecognizer.
+        """
+        recognizers = {}
+        for lang_code, path in self._model_paths.items():
+            print(f"[AssistantHandler] Loading recognizer for '{lang_code}' from: {path}")
+            model = STTModel(path)
+            recognizer = KaldiRecognizer(model, self.samplerate)
+            recognizers[lang_code] = recognizer
+        
+        print("LOADING RECOGNIZERS FINISHED")
+        print("LOADING RECOGNIZERS FINISHED")
+        print("LOADING RECOGNIZERS FINISHED")
+        print("LOADING RECOGNIZERS FINISHED")
+        print("LOADING RECOGNIZERS FINISHED")
+        print("LOADING RECOGNIZERS FINISHED")
+        return recognizers
     
     def on_enter(self):
         # run in a thread so you don't block the FSM loop
@@ -599,8 +619,9 @@ class AssistantHandler(ModeHandler):
     def on_exit(self):
         pass
 
-    def on_frame(self):
-        pass
+    def on_frame(self, frame):
+        # buffer the latest frame for when we run the assistant flow
+        self._latest_frame = frame
 
     def on_tts_done(self):
         return super().on_tts_done()
@@ -625,6 +646,7 @@ class AssistantHandler(ModeHandler):
         frame = self._latest_frame
 
         # 3) call VLM
+        print("[ASSISTANT] Asking VLM:", transcript)
         reply = self.vlm.ask(frame, transcript, "assisting", self.lang)
 
         # 4) speak the reply
@@ -646,7 +668,10 @@ class AssistantHandler(ModeHandler):
         chunk_check_interval = 0.1
         last_chunk_time = start_time
         last_audio_activity = start_time
-        
+
+        print("Audio recording - Please speak your query")
+        print("Audio recording - Please speak your query")
+        print("Audio recording - Please speak your query")
         while time.time() - start_time < duration:
             if self.observer.audio:
                 audio.extend(self.observer.audio)
@@ -677,9 +702,8 @@ class AssistantHandler(ModeHandler):
         return audio
     
 
-    def transcribe_audio(audio, recognizer):
-        mic_channels = 7
-        mono_audio = audio[::mic_channels]
+    def transcribe_audio(self, audio, recognizer):
+        mono_audio = audio[::self.channels]
         max_sample_value = max(abs(min(mono_audio)), max(mono_audio))
         
         if max_sample_value > 0:
@@ -723,9 +747,9 @@ class TerminateHandler(ModeHandler):
             except Exception as e:
                 print(f"⚠️  Error during cleanup: {e}")
                 
-        gc.collect()
+        items_cleared = gc.collect()
         print("Cleanup complete!")
-        print("Shutting off!")
+        print("Items_cleared:", items_cleared)
 
         
 
@@ -927,32 +951,53 @@ class FrameOverlay:
         if not lines:
             return frame
 
-        # compute rectangle height
-        (text_h, _), = cv2.getTextSize(lines[0], self.font,
-                                       self.font_scale, self.thickness)
+        # Get the size of one line to compute heights
+        (text_w, text_h), baseline = cv2.getTextSize(
+        lines[0],
+        self.font,
+        self.font_scale,
+        self.thickness
+        )
         line_h = text_h + 5
-        rect_h = line_h * len(lines) + 2*self.padding
+        rect_h = line_h * len(lines) + 2 * self.padding
         h, w = frame.shape[:2]
         y0 = h - rect_h
 
-        # draw background
+        # Draw semi-transparent background
         overlay = frame.copy()
-        cv2.rectangle(overlay, (0, y0), (w, h),
-                      (255,255,255), -1)
+        cv2.rectangle(
+        overlay,
+        (0, y0),
+        (w, h),
+        (255, 255, 255),
+        -1
+        )
         frame = cv2.addWeighted(overlay, 0.6, frame, 0.4, 0)
 
-        # draw each line centered
+        # Draw each line, centered
         y = y0 + self.padding + text_h
         for line in lines:
-            text_w, _ = cv2.getTextSize(line, self.font,
-                                        self.font_scale, self.thickness)[0]
+            (text_w, _), _ = cv2.getTextSize(
+            line,
+            self.font,
+            self.font_scale,
+            self.thickness
+        )
             x = (w - text_w) // 2
-            cv2.putText(frame, line, (x, y),
-                        self.font, self.font_scale,
-                        (0,0,0), self.thickness, cv2.LINE_AA)
+            cv2.putText(
+            frame,
+            line,
+            (x, y),
+            self.font,
+            self.font_scale,
+            (0, 0, 0),
+            self.thickness,
+            cv2.LINE_AA
+        )
             y += line_h
 
         return frame
+
 
     def _draw_help(self, frame):
         if not self.show_help_flag:
@@ -1056,10 +1101,10 @@ def display_loop(event_queue, overlay):
     cv2.destroyAllWindows()
 
 
+
+
 event_queue = queue.Queue()
-audio_queue = deque(maxlen=50)
-
-
+audio_queue = deque(maxlen=10)
 
 def main():
     annotation_queue = deque(maxlen=5)
