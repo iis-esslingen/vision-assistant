@@ -17,6 +17,7 @@ import pyaudio
 import numpy as np
 from PIL import Image
 import cv2
+cv2.getBuildInformation()
 import soundfile as sf
 from TTS.api import TTS
 import multiprocessing
@@ -206,7 +207,13 @@ def keyword_listener(event_queue, keyword_listening_flag, global_running_flag, c
         if kw == "computer":
             print("[KWS] → COMPUTER")
             play_keyword_sound()
-            event_queue.put(Event(EventType.KW_COMPUTER))
+
+            print("[KWS] about to queue event KW_COMPUTER…")
+            try:
+                event_queue.put(Event(EventType.KW_COMPUTER))
+                print(f"[KWS] queued event, queue size now {event_queue.qsize()}")
+            except Exception as e:
+                print(f"[KWS] ⚠️ event_queue.put() threw: {e}")
 
         elif kw == "caption":
             print("[KWS] → CAPTION")
@@ -569,7 +576,7 @@ class GuidingHandler(ModeHandler):
     
 
 class AssistantHandler(ModeHandler):
-    def __init__(self, vlm_service, tts_service, annotation_queue, observer, lang, keyword_listening_flag, event_queue):
+    def __init__(self, vlm_service, tts_service, recognizers, annotation_queue, observer, lang, keyword_listening_flag, event_queue):
         print("Init AssistantHandler!!")
         print("Init AssistantHandler!!")
         self.vlm = vlm_service
@@ -582,35 +589,10 @@ class AssistantHandler(ModeHandler):
         self.annotation_queue = annotation_queue
         self.samplerate = 48000
         self.channels = 7
+        self.recognizers = recognizers
 
-        # STT Models
-        self._model_paths = {
-            "en": "./vosk-model-en-us-0.22",
-            "de": "./vosk-model-de-0.21"
-        }
-
-        self.recognizers = self._load_recognizers()
-
-    
-    def _load_recognizers(self) -> dict[str, KaldiRecognizer]:
-        """
-        Load STT models and wrap them in recognizers.
-        Returns a dict mapping language codes to KaldiRecognizer.
-        """
-        recognizers = {}
-        for lang_code, path in self._model_paths.items():
-            print(f"[AssistantHandler] Loading recognizer for '{lang_code}' from: {path}")
-            model = STTModel(path)
-            recognizer = KaldiRecognizer(model, self.samplerate)
-            recognizers[lang_code] = recognizer
         
-        print("LOADING RECOGNIZERS FINISHED")
-        print("LOADING RECOGNIZERS FINISHED")
-        print("LOADING RECOGNIZERS FINISHED")
-        print("LOADING RECOGNIZERS FINISHED")
-        print("LOADING RECOGNIZERS FINISHED")
-        print("LOADING RECOGNIZERS FINISHED")
-        return recognizers
+
     
     def on_enter(self):
         # run in a thread so you don't block the FSM loop
@@ -627,6 +609,7 @@ class AssistantHandler(ModeHandler):
         return super().on_tts_done()
 
     def _run_assistant_flow(self):
+        print("STARTING ASSISTANT FLOW")
 
         # pause KWS
         self.kws_flag.value = False
@@ -855,6 +838,7 @@ class FSMEngine:
 
         while self._running and self.global_running_flag.value:
             event = self.event_queue.get()
+            print(f"[FSM] ← Received event: {event.type}")
             # global quit
             if event.type is EventType.QUIT:
                 print("FSM ENGINE READS EVENTTYPE QUIT")
@@ -1025,27 +1009,32 @@ class FrameOverlay:
         frame = self._draw_help(frame)
         return frame
 
-def frame_producer(observer, event_queue, global_running_flag, overlay=None, fps=10):
+def frame_producer(observer,
+                   fsm_event_queue: queue.Queue,
+                   display_event_queue: queue.Queue,
+                   global_running_flag,
+                   overlay=None,
+                   fps: float = 10.0):
     """
     Continuously:
       • pull the latest RGB image from observer,
       • process it (rotate + BGR→RGB),
-      • draw overlays (if provided),
-      • send raw frame to event_queue as EventType.FRAME_CAPTURED,
+      • send it to the FSM as a FRAME_CAPTURED event,
+      • send the raw frame to the display queue,
+      • sleep to maintain ~fps.
     """
-    
     interval = 1.0 / fps
     last_time = time.time()
 
-    while global_running_flag.value == True:
-        # throttle to target fps
+    while global_running_flag.value:
+        # 1) throttle to target fps
         now = time.time()
-        sleep_for = interval - (now - last_time)
-        if sleep_for > 0:
-            time.sleep(sleep_for)
+        to_sleep = interval - (now - last_time)
+        if to_sleep > 0:
+            time.sleep(to_sleep)
         last_time = time.time()
 
-        # 1) grab & process the RGB image
+        # 2) grab & preprocess the RGB image
         if aria.CameraId.Rgb in observer.images:
             img = observer.images.pop(aria.CameraId.Rgb)
             frame = np.rot90(img, -1)
@@ -1054,21 +1043,19 @@ def frame_producer(observer, event_queue, global_running_flag, overlay=None, fps
             # no new frame yet
             continue
 
-        # 2) draw overlays if you have them
-        display = frame
-        if overlay is not None:
-            display = overlay.render(frame)
+        # 3) publish to the FSM
+        fsm_event_queue.put(Event(EventType.FRAME_CAPTURED, frame))
 
-        
+        # 4) publish raw frame for display
+        display_event_queue.put(frame)
 
-        # 4) publish raw frame to FSM
-        event_queue.put(Event(EventType.FRAME_CAPTURED, frame))
+        # 5) tiny pause to yield
         time.sleep(0.001)
 
 
 
 
-def display_loop(event_queue, overlay):
+def display_loop(display_queue, fsm_queue, global_running_flag, overlay):
     """
     Pull FRAME_CAPTURED events off event_queue, render them, and
     run cv2.imshow/ waitKey on the main thread.
@@ -1076,41 +1063,65 @@ def display_loop(event_queue, overlay):
     window = "Aria View"
     cv2.namedWindow(window, cv2.WINDOW_NORMAL)
 
-    while True:
-        ev = event_queue.get()
-        if ev.type is EventType.QUIT:
-            print("is this reached after pressing Q?")
-            event_queue.put(ev)
-            # 2) send shutdown to TTS worker
-            break
+    while global_running_flag.value:
+        try:
+            frame = display_queue.get(timeout=0.1)
+        except queue.Empty:
+            continue
 
-            
-        if ev.type is EventType.FRAME_CAPTURED:
-            frame = ev.payload
-            disp = overlay.render(frame)
-            cv2.imshow(window, disp)
-            key = cv2.waitKey(1) & 0xFF
-            if key == ord('q'):
-                print("Q PRESSED AND EVENTYPE.QUIT PASSED TO event_queue")
-                
-                # signal quit back into the FSM
-                event_queue.put(Event(EventType.QUIT))
-                continue
-            # optionally: map other keys ('h','l', etc) to events...
+
+        display_frame = overlay.render(frame)
+
+        # 3) Show
+        cv2.imshow(window, display_frame)
+
+         # 4) Keyboard handling
+        key = cv2.waitKey(1) & 0xFF
+        if key == ord('q'):
+            print("[display] Q pressed — sending QUIT to FSM")
+            fsm_queue.put(Event(EventType.QUIT))
+            break
 
     cv2.destroyAllWindows()
 
 
 
 
-event_queue = queue.Queue()
+def load_recognizers() -> dict[str, KaldiRecognizer]:
+        model_paths = {
+        "en": "./vosk-model-en-us-0.22",
+        "de": "./vosk-model-de-0.21"
+        }
+
+        recognizers = {}
+        for lang_code, path in model_paths.items():
+            model = STTModel(path)
+            recognizer = KaldiRecognizer(model, 48000) #48khZ
+            recognizers[lang_code] = recognizer
+        
+       
+        print("LOADING RECOGNIZERS FINISHED")
+        return recognizers
+    
+
+#event_queue = queue.Queue()
+fsm_queue = queue.Queue()
+display_queue = queue.Queue()
+
 audio_queue = deque(maxlen=10)
 
 def main():
+
+    global_running_flag = multiprocessing.Value('b', True)
+    tts_queue, tts_proc, kw_flag, tts_enabled_flag = start_tts_process(global_running_flag)
+    tts = TTSService(tts_queue, tts_enabled_flag)
+
+    recognizers = load_recognizers()
+
     annotation_queue = deque(maxlen=5)
     overlay = FrameOverlay(annotation_queue)
 
-    global_running_flag = multiprocessing.Value('b', True)
+    
 
     args = parse_args()
     if args.update_iptables and sys.platform.startswith("linux"):
@@ -1138,8 +1149,6 @@ def main():
     
 
 
-    tts_queue, tts_proc, kw_flag, tts_enabled_flag = start_tts_process(global_running_flag)
-    tts = TTSService(tts_queue, tts_enabled_flag)
 
 
     model = load_vlm_model()
@@ -1153,12 +1162,12 @@ def main():
 
     kws_thread = threading.Thread(
     target=keyword_listener,
-    args=(event_queue, kw_flag, global_running_flag),
+    args=(fsm_queue, kw_flag, global_running_flag),
     daemon=True
     )
     frame_thread = threading.Thread(
         target=frame_producer,
-        args=(observer, event_queue, global_running_flag, overlay),
+        args=(observer, fsm_queue, display_queue, global_running_flag, overlay),
         daemon=True
     )
     
@@ -1174,7 +1183,7 @@ def main():
     
     cleanup_funcs = [
         lambda: tts_queue.put(None),
-        lambda: cv2.destroyAllWindows(),
+        #lambda: cv2.destroyAllWindows(),
         lambda: streaming_client.unsubscribe(),
         lambda: streaming_manager.stop_streaming(),
         lambda: device_client.disconnect(device),
@@ -1191,16 +1200,16 @@ def main():
       Mode.WATCHING:   WatchingHandler(),
       Mode.CAPTIONING: CaptioningHandler(vlm, tts, annotation_queue, initial_language),
       Mode.GUIDING:    GuidingHandler(vlm, tts, annotation_queue, initial_language),
-      Mode.ASSISTANT:  AssistantHandler(vlm, tts, annotation_queue,  observer, initial_language, kw_flag, event_queue),
+      Mode.ASSISTANT:  AssistantHandler(vlm, tts, recognizers, annotation_queue,  observer, initial_language, kw_flag, event_queue=fsm_queue),
       Mode.TERMINATE:  TerminateHandler(cleanup_funcs),
     }
 
     # start event loop, kws listener, frame producer…
-    fsm = FSMEngine(initial=Mode.WATCHING, handlers=handlers, _event_queue=event_queue, global_running_flag=global_running_flag)
+    fsm = FSMEngine(initial=Mode.WATCHING, handlers=handlers, _event_queue=fsm_queue, global_running_flag=global_running_flag)
     fsm_thread = threading.Thread(target=fsm.run)   # default daemon=False
     fsm_thread.start()
 
-    display_loop(event_queue, overlay)
+    display_loop(display_queue=display_queue, fsm_queue=fsm_queue, global_running_flag=global_running_flag, overlay=overlay)
 
     fsm_thread.join(timeout=1)
     print("fsm thread cleaned. final shutdown")
