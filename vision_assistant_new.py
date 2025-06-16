@@ -490,7 +490,7 @@ class WatchingHandler(ModeHandler):
         pass
 
 class CaptioningHandler(ModeHandler):
-    def __init__(self, vlm_service: VLMService, tts_service: TTSService, annotation_queue, lang: str):
+    def __init__(self, vlm_service: VLMService, tts_service: TTSService, annotation_queue, lang: str, fsm_queue):
         print("Init CaptioningHandler!!")
         print("Init CaptioningHandler!!")
         self.vlm = vlm_service
@@ -499,15 +499,69 @@ class CaptioningHandler(ModeHandler):
         self._timer = None
         self._latest_frame = None  # ← buffer here
         self.annotation_queue = annotation_queue
+        self.fsm_queue = fsm_queue
+
+
+        self._busy       = False
+        self._stopped    = threading.Event()
+        self._thread     = None
+        self._interval   = 1
 
     def on_enter(self):
-        # start periodic captions
-        self._timer = RepeatedTimer(3.0, self._do_caption)
+        self._stopped.clear()
+        self._busy = False
+        # Kick off the first one immediately
+        self._thread = threading.Thread(target=self._loop, daemon=True)
+        self._thread.start()
 
     def on_exit(self):
-        if self._timer:
-            self._timer.cancel()
-            self._timer = None
+        # Signal the background loop to stop and wait for it
+        self._stopped.set()
+        if self._thread:
+            self._thread.join(timeout=1)
+
+    def _loop(self):
+        """
+        Background loop running in CAPTIONING mode.
+        Ensures at most one VLM call at a time, with interval delay.
+        """
+        while not self._stopped.is_set():
+            if not self._busy:
+                self._busy = True
+                try:
+                    # Grab the very latest frame from the FSM
+                    frame = self.fsm_queue_latest_frame()
+                    if frame is not None:
+                        prompt = ""  # caption mode uses fixed prompt inside VLMService
+                        caption = self.vlm.ask(frame, prompt, "captioning", self.lang)
+                        self.tts.enqueue_speech(caption, self.lang)
+                        self.annotation_queue.append(caption)
+                except Exception as e:
+                    print(f"[CaptioningHandler] ❌ Error during caption: {e}")
+                finally:
+                    self._busy = False
+
+            # Wait for the configured interval, or until we’re told to stop
+            self._stopped.wait(self._interval)
+    
+    def fsm_queue_latest_frame(self):
+        """
+        Helper: pull out the most recent FRAME_CAPTURED event from the FSM queue
+        so we caption the freshest image.
+        """
+        latest = None
+        try:
+            while True:
+                event = self.fsm_queue.get_nowait()
+                if event.type == EventType.FRAME_CAPTURED:
+                    latest = event.payload
+                else:
+                    # Put back any non-frame events for the FSM to handle
+                    self.fsm_queue.put(event)
+                    break
+        except queue.Empty:
+            pass
+        return latest
 
     def on_frame(self, frame):
         # called by the FSM on every FRAME_CAPTURED event
@@ -841,8 +895,8 @@ class FSMEngine:
             print(f"[FSM] ← Received event: {event.type}")
             # global quit
             if event.type is EventType.QUIT:
-                print("FSM ENGINE READS EVENTTYPE QUIT")
-                print("SWITCHING TO TERMINATE MODE")
+                #print("FSM ENGINE READS EVENTTYPE QUIT")
+                #print("SWITCHING TO TERMINATE MODE")
                 self._swap_to(Mode.TERMINATE)
                 break
 
@@ -1014,12 +1068,12 @@ def frame_producer(observer,
                    display_event_queue: queue.Queue,
                    global_running_flag,
                    overlay=None,
-                   fps: float = 10.0):
+                   fps: float = 20.0):
     """
     Continuously:
       • pull the latest RGB image from observer,
       • process it (rotate + BGR→RGB),
-      • send it to the FSM as a FRAME_CAPTURED event,
+      • send it to the FSM as a FRAME_CAPTURED event (keeping only one in flight),
       • send the raw frame to the display queue,
       • sleep to maintain ~fps.
     """
@@ -1035,21 +1089,29 @@ def frame_producer(observer,
         last_time = time.time()
 
         # 2) grab & preprocess the RGB image
-        if aria.CameraId.Rgb in observer.images:
-            img = observer.images.pop(aria.CameraId.Rgb)
-            frame = np.rot90(img, -1)
-            frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        else:
-            # no new frame yet
+        if aria.CameraId.Rgb not in observer.images:
             continue
 
-        # 3) publish to the FSM
-        fsm_event_queue.put(Event(EventType.FRAME_CAPTURED, frame))
+        img = observer.images.pop(aria.CameraId.Rgb)
+        frame = np.rot90(img, -1)
+        frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
 
-        # 4) publish raw frame for display
+        # 3) enqueue to FSM queue, replacing any old frame
+        evt = Event(EventType.FRAME_CAPTURED, frame)
+        try:
+            # try to insert; if full, drop the old one first
+            fsm_event_queue.put_nowait(evt)
+        except queue.Full:
+            try:
+                _ = fsm_event_queue.get_nowait()
+            except queue.Empty:
+                pass
+            fsm_event_queue.put_nowait(evt)
+
+        # 4) publish raw frame for display (no cap)
         display_event_queue.put(frame)
 
-        # 5) tiny pause to yield
+        # 5) tiny yield to avoid spinning too tight
         time.sleep(0.001)
 
 
@@ -1105,7 +1167,7 @@ def load_recognizers() -> dict[str, KaldiRecognizer]:
     
 
 #event_queue = queue.Queue()
-fsm_queue = queue.Queue()
+fsm_queue = queue.Queue(maxsize=1)
 display_queue = queue.Queue()
 
 audio_queue = deque(maxlen=10)
@@ -1198,7 +1260,7 @@ def main():
 
     handlers = {
       Mode.WATCHING:   WatchingHandler(),
-      Mode.CAPTIONING: CaptioningHandler(vlm, tts, annotation_queue, initial_language),
+      Mode.CAPTIONING: CaptioningHandler(vlm, tts, annotation_queue, initial_language, fsm_queue=fsm_queue),
       Mode.GUIDING:    GuidingHandler(vlm, tts, annotation_queue, initial_language),
       Mode.ASSISTANT:  AssistantHandler(vlm, tts, recognizers, annotation_queue,  observer, initial_language, kw_flag, event_queue=fsm_queue),
       Mode.TERMINATE:  TerminateHandler(cleanup_funcs),
