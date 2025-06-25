@@ -135,7 +135,7 @@ def normalize_audio_buffer(buffer):
 
 
 def create_kws_model():
-    grammar = '["vision", "assistant", "computer", "caption", "observer", "language", "please", "obligation", "misunderstanding", "actually", "basically", "literally", "seriously", "honestly", "definitely", "probably", "anyway", "certainly", "absolutely", "ultimately", "eventually", "genuinely", "ostensibly", "apparently", "evidently", "naturally", "obviously", "remarkably", "specifically", "especially", "importantly", "consequently", "subsequently", "furthermore", "meanwhile", "nonetheless", "regardless", "wherever", "whenever", "however", "therefore", "although", "whereas", "unless", "besides", "indeed", "merely", "simply", "barely", "hardly", "seldom", "rarely", "always", "usually", "often", "hardly", "merely", "nearly", "quite", "rather", "pretty", "truly", "really", "fully", "partly", "mostly", "merely", "solely", "chiefly", "largely", "mainly", "namely", "broadly", "roughly", "mostly", "usually", "often", "seldom", "rarely", "always", "sometimes", "anyhow", "somehow", "anywhere", "somewhere", "everywhere", "nowhere", "anytime", "sometime", "everytime", "never", "forever", "today", "tomorrow", "yesterday", "tonight", "indeed", "rather", "pretty", "quite", "just", "then", "soon", "early", "late", "next", "last", "first", "final", "briefly", "suddenly", "slowly", "quickly", "hardly", "softly", "loudly", "clearly", "fairly"]'
+    grammar = '["vision", "assistant", "computer", "caption", "watching", "language", "please", "obligation", "misunderstanding", "actually", "basically", "literally", "seriously", "honestly", "definitely", "probably", "anyway", "certainly", "absolutely", "ultimately", "eventually", "genuinely", "ostensibly", "apparently", "evidently", "naturally", "obviously", "remarkably", "specifically", "especially", "importantly", "consequently", "subsequently", "furthermore", "meanwhile", "nonetheless", "regardless", "wherever", "whenever", "however", "therefore", "although", "whereas", "unless", "besides", "indeed", "merely", "simply", "barely", "hardly", "seldom", "rarely", "always", "usually", "often", "hardly", "merely", "nearly", "quite", "rather", "pretty", "truly", "really", "fully", "partly", "mostly", "merely", "solely", "chiefly", "largely", "mainly", "namely", "broadly", "roughly", "mostly", "usually", "often", "seldom", "rarely", "always", "sometimes", "anyhow", "somehow", "anywhere", "somewhere", "everywhere", "nowhere", "anytime", "sometime", "everytime", "never", "forever", "today", "tomorrow", "yesterday", "tonight", "indeed", "rather", "pretty", "quite", "just", "then", "soon", "early", "late", "next", "last", "first", "final", "briefly", "suddenly", "slowly", "quickly", "hardly", "softly", "loudly", "clearly", "fairly"]'
     model = STTModel("./vosk-model-small-en-us-0.15")
     recognizer = KaldiRecognizer(model, 48000, grammar)
     return recognizer
@@ -469,7 +469,7 @@ class VLMService:
         self.guiding_prompt = {
             "en": "IMPORTANT: Your response must be no more than 25 words. Do not exceed this limit. I am a visually impaired person and need assistance navigating my environment. I am wearing glasses that capture this image from my perspective. Please provide detailed spatial guidance including: \n - distances to objects,\n - potential obstacles or hazards,\n - directional instructions (left/right/forward),\n - and step-by-step navigation advice.\n Be specific about what I should do next. Do not mention my visual impairment or camera details",
             #rewrite the prompts as you are [ROLE] ...
-            "de": "WICHTIG: Deine Antwort darf maximal 25 Wörter haben. Ich benötige Hilfe bei der Navigation. Ich trage eine Brille mit Kamera. Gib mir räumliche Orientierung: Entfernungen, Hindernisse, Richtungsangaben (links/rechts/vorwärts) und konkrete nächste Schritte. Erwähne nicht meine Sehbehinderung. Meine Frage:\n"
+            "de": "WICHTIG: Deine Antwort darf maximal 25 Wörter haben. Ich benötige Hilfe bei der Navigation. Ich trage eine Brille mit Kamera. Gib mir räumliche Orientierung: Entfernungen, Hindernisse, Richtungsangaben (links/rechts/vorwärts) und konkrete nächste Schritte. Erwähne nicht meine Sehbehinderung"
         }
 
     def _get_prefix(self, mode: str, lang: str) -> str:
@@ -528,7 +528,7 @@ class WatchingHandler(ModeHandler):
         pass
 
 class CaptioningHandler(ModeHandler):
-    def __init__(self, vlm_service: VLMService, tts_service: TTSService, annotation_queue, lang: str, fsm_queue):
+    def __init__(self, vlm_service: VLMService, tts_service: TTSService, annotation_queue, lang: str):
         print("Init CaptioningHandler!!")
         print("Init CaptioningHandler!!")
         self.vlm = vlm_service
@@ -537,13 +537,14 @@ class CaptioningHandler(ModeHandler):
         self._timer = None
         self._latest_frame = None  # ← buffer here
         self.annotation_queue = annotation_queue
-        self.fsm_queue = fsm_queue
+        self._log_entries  = []       # we'll use this name everywhere
+        self._log_filename = None
 
 
         self._busy       = False
         self._stopped    = threading.Event()
         self._thread     = None
-        self._interval   = 1
+        self._interval   = 3
 
     def on_language_switch(self):
         old = self.lang_state.lang
@@ -552,10 +553,16 @@ class CaptioningHandler(ModeHandler):
         print(f"[CaptioningHandler] 🌐 Language: {old} → {new}")
 
     def on_enter(self):
-        print("CAPTIONING MODE ENTERED")
+        # pick a fresh logfile name for this session
+        ts0 = int(time.time() * 1000)
+        os.makedirs("debug_capt", exist_ok=True)
+        self._log_filename = f"debug_capt/captions_log_{ts0}.json"
+
+        print(f"▶ Entered CAPTIONING mode; logging to {self._log_filename}")
         self._stopped.clear()
-        self._busy = False
-        # Kick off the first one immediately
+        # immediate first caption
+        self._do_caption()
+        # then periodic loop
         self._thread = threading.Thread(target=self._loop, daemon=True)
         self._thread.start()
 
@@ -567,47 +574,60 @@ class CaptioningHandler(ModeHandler):
             self._thread.join(timeout=1)
 
     def _loop(self):
-        """
-        Background loop running in CAPTIONING mode.
-        Ensures at most one VLM call at a time, with interval delay.
-        """
         while not self._stopped.is_set():
-            if not self._busy:
+            if not self._busy and self._latest_frame is not None:
                 self._busy = True
                 try:
-                    # Grab the very latest frame from the FSM
-                    frame = self.fsm_queue_latest_frame()
-                    if frame is not None:
-                        prompt = ""  # caption mode uses fixed prompt inside VLMService
-                        caption = self.vlm.ask(frame, prompt, "captioning", self.lang_state.lang)
-                        self.tts.enqueue_speech(caption, self.lang_state.lang)
-                        self.annotation_queue.append(caption)
+                    frame = self._latest_frame
+                    ts = int(time.time() * 1000)
+
+                    # 1) save frame
+                    frame_file = f"debug_capt/frame_{ts}.jpg"
+                    cv2.imwrite(frame_file, frame)
+                    print(f"[DEBUG] Saved image to {frame_file}")
+
+                    # 2) build prompt
+                    prefix      = self.vlm._get_prefix("captioning", self.lang_state.lang)
+                    full_prompt = prefix
+
+                    # 3) call VLM and time it
+                    start   = time.perf_counter()
+                    caption = self.vlm.ask(frame, "", "captioning", self.lang_state.lang)
+                    duration = time.perf_counter() - start
+                    print(f"[Caption] took {duration:.2f}s → “{caption}”")
+
+                    # 4) speak & annotate
+                    self.tts.enqueue_speech(caption, self.lang_state.lang)
+                    self.annotation_queue.append(caption)
+
+                    # 5) record log entry
+                    entry = {
+                        "timestamp":   ts,
+                        "frame_file":  frame_file,
+                        "prompt":      full_prompt,
+                        "caption":     caption,
+                        "duration_s":  duration
+                    }
+                    self._log_entries.append(entry)
+
+                    # 6) write out JSON log
+                    try:
+                        with open(self._log_filename, "w", encoding="utf-8") as f:
+                            json.dump(self._log_entries, f, ensure_ascii=False, indent=2)
+                        print(f"[DEBUG] Wrote {len(self._log_entries)} entries to {self._log_filename}")
+                    except Exception as e:
+                        print(f"[DEBUG] ❌ Failed to write JSON log: {e}")
+
                 except Exception as e:
                     print(f"[CaptioningHandler] ❌ Error during caption: {e}")
                 finally:
                     self._busy = False
 
-            # Wait for the configured interval, or until we’re told to stop
+            # wait interval or until stopped
             self._stopped.wait(self._interval)
+        
     
-    def fsm_queue_latest_frame(self):
-        """
-        Helper: pull out the most recent FRAME_CAPTURED event from the FSM queue
-        so we caption the freshest image.
-        """
-        latest = None
-        try:
-            while True:
-                event = self.fsm_queue.get_nowait()
-                if event.type == EventType.FRAME_CAPTURED:
-                    latest = event.payload
-                else:
-                    # Put back any non-frame events for the FSM to handle
-                    self.fsm_queue.put(event)
-                    break
-        except queue.Empty:
-            pass
-        return latest
+    
 
     def on_frame(self, frame):
         # called by the FSM on every FRAME_CAPTURED event
@@ -618,17 +638,20 @@ class CaptioningHandler(ModeHandler):
         pass
 
     def _do_caption(self):
-        start = time.perf_counter()
         frame = self._latest_frame
         if frame is None:
             return
 
-        caption = self.vlm.ask(frame, "", "captioning", self.lang_state.lang)
-        elapsed = time.perf_counter() - start
-        print(f"[Caption] took {elapsed:.2f}s")
-
-        self.tts.enqueue_speech(caption, self.lang_state.lang)
-        self.annotation_queue.append(caption)
+        self._busy = True
+        try:
+            caption = self.vlm.ask(frame, "", "captioning", self.lang_state.lang)
+            print(f"[Caption] “{caption}”")
+            self.tts.enqueue_speech(caption, self.lang_state.lang)
+            self.annotation_queue.append(caption)
+        except Exception as e:
+            print(f"[CaptioningHandler] ❌ caption error: {e}")
+        finally:
+            self._busy = False
 
         
 
@@ -699,6 +722,9 @@ class AssistantHandler(ModeHandler):
         self.pause_frame_flag = pause_frame_flag
         self.pause_audio_flag = pause_audio_flag
 
+        self._log_entries   = []      # in-memory list of dictionaries
+        self._log_filename  = None
+
         
     def on_language_switch(self):
         old = self.lang_state.lang
@@ -707,7 +733,14 @@ class AssistantHandler(ModeHandler):
         print(f"[AssistantHandler] 🌐 Language: {old} → {new}")
     
     def on_enter(self):
-        # run in a thread so you don't block the FSM loop
+
+        # create a fresh logfile for this assistant session
+        ts0 = int(time.time() * 1000)
+        os.makedirs("debug_assist", exist_ok=True)
+        self._log_filename = f"debug_assist/assistant_log_{ts0}.json"
+        print(f"▶ Entered ASSISTANT mode; logging to {self._log_filename}")
+
+        # run the assistant flow in background
         threading.Thread(target=self._run_assistant_flow, daemon=True).start()
 
     def on_exit(self):
@@ -755,25 +788,40 @@ class AssistantHandler(ModeHandler):
         frame = self._latest_frame
 
 
-        # ─── DEBUG: write out the frame ───
-        debug_dir = "debug_frames"
-        os.makedirs(debug_dir, exist_ok=True)
+        # ─── DEBUG: dump frame to disk ───
         ts = int(time.time() * 1000)
-        debug_path = os.path.join(debug_dir, f"assistant_frame_{ts}.jpg")
-        # frame is your numpy array (whatever channel order it currently has)
-        if cv2.imwrite(debug_path, frame):
-            print(f"[DEBUG] Saved frame to {debug_path}")
-        else:
-            print(f"[DEBUG] ❌ Failed to save frame")
+        frame_file = f"debug_assist/frame_{ts}.jpg"
+        cv2.imwrite(frame_file, frame)
+        print(f"[DEBUG] Saved frame to {frame_file}")
+
+        # ─── PREPARE full_prompt ───
+        prefix      = self.vlm._get_prefix("assisting", self.lang_state.lang)
+        full_prompt = prefix + transcript
+
+        print("[ASSISTANT] Asking VLM:", transcript)
+        start = time.perf_counter()
+        reply = self.vlm.ask(frame, transcript, "assisting", self.lang_state.lang)
+        duration = time.perf_counter() - start
+        print(f"[ASSISTANT] VLM took {duration:.2f}s → “{reply}”")
         
 
-        # 3) call VLM
-        print("[ASSISTANT] Asking VLM:", transcript)
-        reply = self.vlm.ask(frame, transcript, "assisting", self.lang_state.lang)
+        
 
         # 4) speak the reply
         self.tts.enqueue_speech(reply, self.lang_state.lang)
         self.annotation_queue.append(reply)
+
+        # ─── LOG entry ───
+        entry = {
+            "timestamp":   ts,
+            "frame_file":  frame_file,
+            "prompt":      full_prompt,
+            "response":    reply,
+            "duration_s":  duration
+        }
+        self._log_entries.append(entry)
+        with open(self._log_filename, "w", encoding="utf-8") as f:
+            json.dump(self._log_entries, f, ensure_ascii=False, indent=2)
 
         # 5) notify FSM that we're done
         self.event_queue.put(Event(EventType.ASSISTANT_DONE))
@@ -1391,7 +1439,7 @@ def main():
 
     handlers = {
       Mode.WATCHING:   WatchingHandler(lang=initial_language),
-      Mode.CAPTIONING: CaptioningHandler(vlm, tts, annotation_queue, lang=initial_language, fsm_queue=fsm_queue),
+      Mode.CAPTIONING: CaptioningHandler(vlm, tts, annotation_queue, lang=initial_language),
       Mode.GUIDING:    GuidingHandler(vlm, tts, annotation_queue, lang=initial_language),
       Mode.ASSISTANT:  AssistantHandler(vlm, tts, recognizers, annotation_queue,  observer, initial_language, kw_flag, event_queue=fsm_queue, pause_frame_flag=pause_frame_flag, pause_audio_flag=pause_audio_flag),
       Mode.TERMINATE:  TerminateHandler(cleanup_funcs),
