@@ -228,18 +228,22 @@ def keyword_listener(event_queue, keyword_listening_flag, global_running_flag, c
                 print(f"[KWS] ⚠️ event_queue.put() threw: {e}")
 
         elif kw == "caption":
+            keyword_audio = []
             print("[KWS] → CAPTION")
             event_queue.put(Event(EventType.KW_CAPTION))
 
         elif kw == "guiding":
+            keyword_audio = []
             print("[KWS] → GUIDANCE")
             event_queue.put(Event(EventType.KW_GUIDANCE))
 
         elif kw == "watching":
+            keyword_audio = []
             print("[KWS] → WATCHING")
             event_queue.put(Event(EventType.WATCHING))
 
         elif kw == "language":
+            keyword_audio = []
             print("[KWS] → LANGUAGE_SWITCH")
             # payload can be omitted; FSM will flip context.language
             event_queue.put(Event(EventType.LANGUAGE_SWITCH))
@@ -442,6 +446,10 @@ class ModeHandler(ABC):
         so you can clean up or transition back to “watching.”
         """
         raise NotImplementedError
+        
+    def on_language_switch(self):
+        """Called whenever the user says 'language' in *any* mode."""
+        pass
     
 
 class VLMService:
@@ -482,14 +490,31 @@ class VLMService:
         print("[VLM SERVICE] - passing full prompt into vlm: ", full_prompt)
         # convert OpenCV frame to PIL if your model needs
         pil = Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
+
+
+        # ─── DEBUG: dump PIL to disk ───
+        os.makedirs("debug_pil", exist_ok=True)
+        debug_path = f"debug_pil/frame_for_vlm_{int(time.time()*1000)}.jpg"
+        pil.save(debug_path, format="JPEG")
+        print(f"[DEBUG] Saved PIL image to {debug_path}")
+        
         return self.model.ask(pil, prompt=full_prompt)
 
 
 
 class WatchingHandler(ModeHandler):
-    def __init__(self):
+    def __init__(self, lang):
         print("Init WatchingHandler!!")
         print("Init WatchingHandler!!")
+        self.lang_state = lang
+
+    
+    def on_language_switch(self):
+        old = self.lang_state.lang
+        self.lang_state.toggle()
+        new = self.lang_state.lang
+        print(f"[WatchingHandler] 🌐 Language: {old} → {new}")
+
     def on_enter(self):
         print("▶ Now watching (idle).")
 
@@ -508,7 +533,7 @@ class CaptioningHandler(ModeHandler):
         print("Init CaptioningHandler!!")
         self.vlm = vlm_service
         self.tts = tts_service
-        self.lang = lang
+        self.lang_state = lang
         self._timer = None
         self._latest_frame = None  # ← buffer here
         self.annotation_queue = annotation_queue
@@ -520,7 +545,14 @@ class CaptioningHandler(ModeHandler):
         self._thread     = None
         self._interval   = 1
 
+    def on_language_switch(self):
+        old = self.lang_state.lang
+        self.lang_state.toggle()
+        new = self.lang_state.lang
+        print(f"[CaptioningHandler] 🌐 Language: {old} → {new}")
+
     def on_enter(self):
+        print("CAPTIONING MODE ENTERED")
         self._stopped.clear()
         self._busy = False
         # Kick off the first one immediately
@@ -547,8 +579,8 @@ class CaptioningHandler(ModeHandler):
                     frame = self.fsm_queue_latest_frame()
                     if frame is not None:
                         prompt = ""  # caption mode uses fixed prompt inside VLMService
-                        caption = self.vlm.ask(frame, prompt, "captioning", self.lang)
-                        self.tts.enqueue_speech(caption, self.lang)
+                        caption = self.vlm.ask(frame, prompt, "captioning", self.lang_state.lang)
+                        self.tts.enqueue_speech(caption, self.lang_state.lang)
                         self.annotation_queue.append(caption)
                 except Exception as e:
                     print(f"[CaptioningHandler] ❌ Error during caption: {e}")
@@ -591,11 +623,11 @@ class CaptioningHandler(ModeHandler):
         if frame is None:
             return
 
-        caption = self.vlm.ask(frame, "", "captioning", self.lang)
+        caption = self.vlm.ask(frame, "", "captioning", self.lang_state.lang)
         elapsed = time.perf_counter() - start
         print(f"[Caption] took {elapsed:.2f}s")
 
-        self.tts.enqueue_speech(caption, self.lang)
+        self.tts.enqueue_speech(caption, self.lang_state.lang)
         self.annotation_queue.append(caption)
 
         
@@ -609,11 +641,18 @@ class GuidingHandler(ModeHandler):
 
         self.vlm = vlm_service
         self.tts = tts_service
-        self.lang = lang
+        self.lang_state = lang
         self._timer = None
         self._latest_frame = None  # ← buffer here
         self.annotation_queue = annotation_queue
 
+    
+    def on_language_switch(self):
+        old = self.lang_state.lang
+        self.lang_state.toggle()
+        new = self.lang_state.lang
+        print(f"[GuidingHandler] 🌐 Language: {old} → {new}")
+    
     def on_enter(self):
         # every 3s grab the latest frame
         self._timer = RepeatedTimer(3.0, self._do_caption)
@@ -634,8 +673,8 @@ class GuidingHandler(ModeHandler):
         if self._latest_frame is None:
             return
         
-        guidance_text = self.vlm.ask(self._latest_frame, text_prompt="", mode="guiding", lang=self.lang)
-        self.tts.enqueue_speech(guidance_text, self.lang)
+        guidance_text = self.vlm.ask(self._latest_frame, text_prompt="", mode="guiding", lang=self.lang_state.lang)
+        self.tts.enqueue_speech(guidance_text, self.lang_state.lang)
         self.annotation_queue.append(guidance_text)
 
 
@@ -643,13 +682,13 @@ class GuidingHandler(ModeHandler):
     
 
 class AssistantHandler(ModeHandler):
-    def __init__(self, vlm_service, tts_service, recognizers, annotation_queue, observer, lang, keyword_listening_flag, event_queue, pause_frame_flag):
+    def __init__(self, vlm_service, tts_service, recognizers, annotation_queue, observer, lang, keyword_listening_flag, event_queue, pause_frame_flag, pause_audio_flag):
         print("Init AssistantHandler!!")
         print("Init AssistantHandler!!")
         self.vlm = vlm_service
         self.tts = tts_service
         self.observer = observer
-        self.lang = lang
+        self.lang_state = lang
         self.event_queue = event_queue
         self._latest_frame = None
         self.kws_flag = keyword_listening_flag
@@ -658,9 +697,14 @@ class AssistantHandler(ModeHandler):
         self.channels = 7
         self.recognizers = recognizers
         self.pause_frame_flag = pause_frame_flag
+        self.pause_audio_flag = pause_audio_flag
 
         
-
+    def on_language_switch(self):
+        old = self.lang_state.lang
+        self.lang_state.toggle()
+        new = self.lang_state.lang
+        print(f"[AssistantHandler] 🌐 Language: {old} → {new}")
     
     def on_enter(self):
         # run in a thread so you don't block the FSM loop
@@ -678,6 +722,7 @@ class AssistantHandler(ModeHandler):
 
     def _run_assistant_flow(self):
         print("STARTING ASSISTANT FLOW")
+        self.pause_audio_flag.value = True
 
         
 
@@ -688,14 +733,15 @@ class AssistantHandler(ModeHandler):
         # pause frame captured events
         self.pause_frame_flag.value = True
         # 1) record user speech & transcribe
-        print("self.lang is: ", self.lang)
-        recognizer = self.recognizers.get(self.lang, self.recognizers["en"])
+        print("self.lang_state.lang is: ", self.lang_state.lang)
+        recognizer = self.recognizers.get(self.lang_state.lang, self.recognizers["en"])
         transcript = self._record_and_transcribe(recognizer)
-
+        
+        self.pause_audio_flag.value = False
         self.kws_flag.value = True
 
         # 0) Wait up to 0.5s for at least one on_frame() callback
-        timeout = time.time() + 0.5
+        timeout = time.time() + 1
         while self._latest_frame is None and time.time() < timeout:
             time.sleep(0.01)
 
@@ -707,14 +753,26 @@ class AssistantHandler(ModeHandler):
             return
 
         frame = self._latest_frame
+
+
+        # ─── DEBUG: write out the frame ───
+        debug_dir = "debug_frames"
+        os.makedirs(debug_dir, exist_ok=True)
+        ts = int(time.time() * 1000)
+        debug_path = os.path.join(debug_dir, f"assistant_frame_{ts}.jpg")
+        # frame is your numpy array (whatever channel order it currently has)
+        if cv2.imwrite(debug_path, frame):
+            print(f"[DEBUG] Saved frame to {debug_path}")
+        else:
+            print(f"[DEBUG] ❌ Failed to save frame")
         
 
         # 3) call VLM
         print("[ASSISTANT] Asking VLM:", transcript)
-        reply = self.vlm.ask(frame, transcript, "assisting", self.lang)
+        reply = self.vlm.ask(frame, transcript, "assisting", self.lang_state.lang)
 
         # 4) speak the reply
-        self.tts.enqueue_speech(reply, self.lang)
+        self.tts.enqueue_speech(reply, self.lang_state.lang)
         self.annotation_queue.append(reply)
 
         # 5) notify FSM that we're done
@@ -928,6 +986,12 @@ class FSMEngine:
                 #print("SWITCHING TO TERMINATE MODE")
                 self._swap_to(Mode.TERMINATE)
                 break
+            
+            if event.type is EventType.LANGUAGE_SWITCH:
+                print(f"[FSM] handling LANGUAGE_SWITCH in {self.current_mode}")
+                # call a new hook on the handler
+                self.handlers[self.current_mode].on_language_switch()
+                continue
 
             if event.type is EventType.FRAME_CAPTURED:
                 self.handlers[self.current_mode].on_frame(event.payload)
@@ -1184,6 +1248,13 @@ def display_loop(display_queue, fsm_queue, global_running_flag, overlay):
 
 
 
+class LanguageState:
+    def __init__(self, initial: str = "en"):
+        self.lang = initial
+
+    def toggle(self):
+        self.lang = "de" if self.lang == "en" else "en"
+        print("Language switched to: ", self.lang)
 
 
 
@@ -1221,6 +1292,8 @@ def main():
     recognizers = load_recognizers()
 
     pause_frame_flag   = multiprocessing.Value('b', False)
+    pause_audio_flag    = multiprocessing.Value('b', False)
+
 
     
 
@@ -1236,13 +1309,17 @@ def main():
     
     streaming_client, device_client, observer, device, streaming_manager  = init_aria(args)
 
-    def audio_collector(global_running_flag):
+    def audio_collector(global_running_flag, pause_audio_flag):
         print("audio collector thread started!")
         channels = 7
         buffer = []
-        MAX_CHUNKS_PER_CYCLE = 10000
+        MAX_CHUNKS_PER_CYCLE = 15000
 
         while global_running_flag.value:
+            if pause_audio_flag.value:
+                time.sleep(0.01)
+                continue
+            
             drained = 0
             buffer.clear()
             while drained < MAX_CHUNKS_PER_CYCLE and observer.audio:
@@ -1258,7 +1335,7 @@ def main():
     
     collector_thread = threading.Thread(
     target=audio_collector,
-    args=(global_running_flag,),
+    args=(global_running_flag,pause_audio_flag),
     daemon=True)
 
     collector_thread.start()
@@ -1269,7 +1346,8 @@ def main():
 
     model = load_vlm_model()
     vlm = VLMService(model)
-    initial_language = "en"
+    initial_language = LanguageState(initial="en")
+    #initial_language = "en"
 
     cv2.namedWindow("Aria View", cv2.WINDOW_NORMAL)
 
@@ -1312,10 +1390,10 @@ def main():
 
 
     handlers = {
-      Mode.WATCHING:   WatchingHandler(),
-      Mode.CAPTIONING: CaptioningHandler(vlm, tts, annotation_queue, initial_language, fsm_queue=fsm_queue),
-      Mode.GUIDING:    GuidingHandler(vlm, tts, annotation_queue, initial_language),
-      Mode.ASSISTANT:  AssistantHandler(vlm, tts, recognizers, annotation_queue,  observer, initial_language, kw_flag, event_queue=fsm_queue, pause_frame_flag=pause_frame_flag),
+      Mode.WATCHING:   WatchingHandler(lang=initial_language),
+      Mode.CAPTIONING: CaptioningHandler(vlm, tts, annotation_queue, lang=initial_language, fsm_queue=fsm_queue),
+      Mode.GUIDING:    GuidingHandler(vlm, tts, annotation_queue, lang=initial_language),
+      Mode.ASSISTANT:  AssistantHandler(vlm, tts, recognizers, annotation_queue,  observer, initial_language, kw_flag, event_queue=fsm_queue, pause_frame_flag=pause_frame_flag, pause_audio_flag=pause_audio_flag),
       Mode.TERMINATE:  TerminateHandler(cleanup_funcs),
     }
 
