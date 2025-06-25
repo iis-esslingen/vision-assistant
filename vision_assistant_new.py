@@ -43,10 +43,9 @@ from projectaria_tools.core.sensor_data import (
 class StreamingClientObserver:
     def __init__(self):
         print("Init StreamingClientObserver!!")
-        print("Init StreamingClientObserver!!")
         self.images = {}
-        self.audio = []
-        self.audio_timestamps_ns = []
+        self.audio = deque(maxlen=500000)
+        self.audio_timestamps_ns = [] #makes sense to also use a deque here
 
     def on_image_received(self, image: np.array, record: ImageDataRecord):
         self.images[record.camera_id] = image
@@ -56,8 +55,8 @@ class StreamingClientObserver:
         audio_data: AudioData,
         record: AudioDataRecord,
     ):
-        self.audio += audio_data.data
-        self.audio_timestamps_ns += record.capture_timestamps_ns
+        self.audio.extend(audio_data.data)
+        #self.audio_timestamps_ns += record.capture_timestamps_ns
 
 
 
@@ -141,7 +140,7 @@ def create_kws_model():
     recognizer = KaldiRecognizer(model, 48000, grammar)
     return recognizer
 
-def keyword_listener(event_queue, keyword_listening_flag, global_running_flag, cooldown_seconds=2):
+def keyword_listener(event_queue, keyword_listening_flag, global_running_flag, cooldown_seconds=3):
     """
     Listens for keywords and pushes Events onto event_queue.
     - event_queue: queue.Queue[Event]
@@ -160,12 +159,23 @@ def keyword_listener(event_queue, keyword_listening_flag, global_running_flag, c
             #print("[KWS] SLEEPING DUE TO DISABLED keyword_listening_flag.value")
             time.sleep(0.1)
             continue
+        
+        
 
         try:
+
+            if audio_queue:
+                buffer = audio_queue.popleft()
+            else:
+            # sleep longer so we give the collector time to refill
+                time.sleep(0.1)
+                continue
+    
+
             buffer = audio_queue.popleft()
             keyword_audio.extend(buffer)
         except IndexError:
-            print("INDEX ERROR KWS THREAD")
+            print("KWS] EMPTY AUDIO QUEUE")
             time.sleep(0.05)
             continue
 
@@ -205,6 +215,8 @@ def keyword_listener(event_queue, keyword_listening_flag, global_running_flag, c
         
 
         if kw == "computer":
+            print("[KWS] → COMPUTER")
+            print("[KWS] → COMPUTER")
             print("[KWS] → COMPUTER")
             play_keyword_sound()
 
@@ -439,6 +451,7 @@ class VLMService:
         self.model = model
         self.captioning_prompt = {
         "en": "Describe this image in a short single sentence. Please do not exceed 15 words in total.",
+
         "de": "Beschreibe dieses Bild in einem einzigen kurzen Satz. Verwende auf keinen Fall mehr als insgesamt 15 Worte in deiner Antwort."
         }
         self.assistant_prompt = {
@@ -516,6 +529,7 @@ class CaptioningHandler(ModeHandler):
 
     def on_exit(self):
         # Signal the background loop to stop and wait for it
+
         self._stopped.set()
         if self._thread:
             self._thread.join(timeout=1)
@@ -572,19 +586,18 @@ class CaptioningHandler(ModeHandler):
         pass
 
     def _do_caption(self):
-        # only run if we have a fresh frame
-        if self._latest_frame is None:
+        start = time.perf_counter()
+        frame = self._latest_frame
+        if frame is None:
             return
 
-        # ask the VLM for a caption
-        caption = self.vlm.ask(self._latest_frame, 
-                               text_prompt="", 
-                               mode="captioning", 
-                               lang=self.lang)
-        # enqueue for both display & speech
+        caption = self.vlm.ask(frame, "", "captioning", self.lang)
+        elapsed = time.perf_counter() - start
+        print(f"[Caption] took {elapsed:.2f}s")
+
         self.tts.enqueue_speech(caption, self.lang)
-        # if you have an annotation_queue for UI:
         self.annotation_queue.append(caption)
+
         
 
 
@@ -630,7 +643,7 @@ class GuidingHandler(ModeHandler):
     
 
 class AssistantHandler(ModeHandler):
-    def __init__(self, vlm_service, tts_service, recognizers, annotation_queue, observer, lang, keyword_listening_flag, event_queue):
+    def __init__(self, vlm_service, tts_service, recognizers, annotation_queue, observer, lang, keyword_listening_flag, event_queue, pause_frame_flag):
         print("Init AssistantHandler!!")
         print("Init AssistantHandler!!")
         self.vlm = vlm_service
@@ -644,6 +657,7 @@ class AssistantHandler(ModeHandler):
         self.samplerate = 48000
         self.channels = 7
         self.recognizers = recognizers
+        self.pause_frame_flag = pause_frame_flag
 
         
 
@@ -665,22 +679,35 @@ class AssistantHandler(ModeHandler):
     def _run_assistant_flow(self):
         print("STARTING ASSISTANT FLOW")
 
+        
+
+
+
         # pause KWS
         self.kws_flag.value = False
+        # pause frame captured events
+        self.pause_frame_flag.value = True
         # 1) record user speech & transcribe
-
+        print("self.lang is: ", self.lang)
         recognizer = self.recognizers.get(self.lang, self.recognizers["en"])
         transcript = self._record_and_transcribe(recognizer)
 
         self.kws_flag.value = True
 
+        # 0) Wait up to 0.5s for at least one on_frame() callback
+        timeout = time.time() + 0.5
+        while self._latest_frame is None and time.time() < timeout:
+            time.sleep(0.01)
+
         # 2) get the latest frame we saw
         if self._latest_frame is None:
             print("[AssistantHandler] ⚠️  No frame available for assistance.")
             self.event_queue.put(Event(EventType.ASSISTANT_DONE))
+            self.pause_frame_flag.value = False
             return
 
         frame = self._latest_frame
+        
 
         # 3) call VLM
         print("[ASSISTANT] Asking VLM:", transcript)
@@ -692,11 +719,13 @@ class AssistantHandler(ModeHandler):
 
         # 5) notify FSM that we're done
         self.event_queue.put(Event(EventType.ASSISTANT_DONE))
+        self.pause_frame_flag.value = False
 
 
     #detects silence
     def record_audio(self):
         self.observer.audio.clear()
+        
         audio = []
         start_time = time.time()
         duration = 20
@@ -892,7 +921,7 @@ class FSMEngine:
 
         while self._running and self.global_running_flag.value:
             event = self.event_queue.get()
-            print(f"[FSM] ← Received event: {event.type}")
+            print(f"[FSM] ← Recieved event: {event.type}")
             # global quit
             if event.type is EventType.QUIT:
                 #print("FSM ENGINE READS EVENTTYPE QUIT")
@@ -1068,6 +1097,7 @@ def frame_producer(observer,
                    display_event_queue: queue.Queue,
                    global_running_flag,
                    overlay=None,
+                   pause_frame_flag=None,
                    fps: float = 20.0):
     """
     Continuously:
@@ -1081,6 +1111,10 @@ def frame_producer(observer,
     last_time = time.time()
 
     while global_running_flag.value:
+        if pause_frame_flag.value:
+            time.sleep(0.05)
+            continue
+
         # 1) throttle to target fps
         now = time.time()
         to_sleep = interval - (now - last_time)
@@ -1091,21 +1125,25 @@ def frame_producer(observer,
         # 2) grab & preprocess the RGB image
         if aria.CameraId.Rgb not in observer.images:
             continue
-
+        
+        #print("len of observer.images before pop is", len(observer.images))
         img = observer.images.pop(aria.CameraId.Rgb)
+        #print("len of observer.images after pop is", len(observer.images))
         frame = np.rot90(img, -1)
         frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
 
-        # 3) enqueue to FSM queue, replacing any old frame
+        # 3) enqueue to FSM queue, replacing only stale FRAME_CAPTURED
         evt = Event(EventType.FRAME_CAPTURED, frame)
         try:
-            # try to insert; if full, drop the old one first
+            # fast‐path: if queue not full, just put
             fsm_event_queue.put_nowait(evt)
         except queue.Full:
-            try:
-                _ = fsm_event_queue.get_nowait()
-            except queue.Empty:
-                pass
+            # queue is full—peek the old event
+            old = fsm_event_queue.get_nowait()
+            if old.type != EventType.FRAME_CAPTURED:
+                # put back control events
+                fsm_event_queue.put_nowait(old)
+            # now enqueue the fresh frame
             fsm_event_queue.put_nowait(evt)
 
         # 4) publish raw frame for display (no cap)
@@ -1115,15 +1153,12 @@ def frame_producer(observer,
         time.sleep(0.001)
 
 
-
-
 def display_loop(display_queue, fsm_queue, global_running_flag, overlay):
-    """
-    Pull FRAME_CAPTURED events off event_queue, render them, and
-    run cv2.imshow/ waitKey on the main thread.
-    """
     window = "Aria View"
     cv2.namedWindow(window, cv2.WINDOW_NORMAL)
+
+    frame_count = 0
+    t_start     = time.perf_counter()
 
     while global_running_flag.value:
         try:
@@ -1131,20 +1166,23 @@ def display_loop(display_queue, fsm_queue, global_running_flag, overlay):
         except queue.Empty:
             continue
 
+        frame_count += 1
+        now = time.perf_counter()
+        if now - t_start >= 1.0:
+            fps = frame_count / (now - t_start)
+            print(f"[Perf] Display FPS: {fps:.1f}")
+            frame_count = 0
+            t_start     = now
 
         display_frame = overlay.render(frame)
-
-        # 3) Show
         cv2.imshow(window, display_frame)
-
-         # 4) Keyboard handling
-        key = cv2.waitKey(1) & 0xFF
-        if key == ord('q'):
-            print("[display] Q pressed — sending QUIT to FSM")
+        if (cv2.waitKey(1) & 0xFF) == ord('q'):
             fsm_queue.put(Event(EventType.QUIT))
             break
 
     cv2.destroyAllWindows()
+
+
 
 
 
@@ -1172,6 +1210,8 @@ display_queue = queue.Queue()
 
 audio_queue = deque(maxlen=10)
 
+
+
 def main():
 
     global_running_flag = multiprocessing.Value('b', True)
@@ -1179,6 +1219,11 @@ def main():
     tts = TTSService(tts_queue, tts_enabled_flag)
 
     recognizers = load_recognizers()
+
+    pause_frame_flag   = multiprocessing.Value('b', False)
+
+    
+
 
     annotation_queue = deque(maxlen=5)
     overlay = FrameOverlay(annotation_queue)
@@ -1194,13 +1239,22 @@ def main():
     def audio_collector(global_running_flag):
         print("audio collector thread started!")
         channels = 7
+        buffer = []
+        MAX_CHUNKS_PER_CYCLE = 10000
+
         while global_running_flag.value:
-        # Drain all available chunks
-            while observer.audio:
-                # If observer.audio is a list:
-                mono_audio = observer.audio[::channels]
-                audio_queue.append(mono_audio)
-            time.sleep(0.01)  
+            drained = 0
+            buffer.clear()
+            while drained < MAX_CHUNKS_PER_CYCLE and observer.audio:
+                buffer.append(observer.audio.popleft())
+                drained += 1
+
+            if buffer:
+                mono = buffer[::channels]
+                audio_queue.append(mono)
+
+
+            time.sleep(0.01) 
     
     collector_thread = threading.Thread(
     target=audio_collector,
@@ -1220,8 +1274,7 @@ def main():
     cv2.namedWindow("Aria View", cv2.WINDOW_NORMAL)
 
     
-
-
+    print("STARTING KWS THREAD")
     kws_thread = threading.Thread(
     target=keyword_listener,
     args=(fsm_queue, kw_flag, global_running_flag),
@@ -1229,7 +1282,7 @@ def main():
     )
     frame_thread = threading.Thread(
         target=frame_producer,
-        args=(observer, fsm_queue, display_queue, global_running_flag, overlay),
+        args=(observer, fsm_queue, display_queue, global_running_flag, overlay, pause_frame_flag),
         daemon=True
     )
     
@@ -1262,7 +1315,7 @@ def main():
       Mode.WATCHING:   WatchingHandler(),
       Mode.CAPTIONING: CaptioningHandler(vlm, tts, annotation_queue, initial_language, fsm_queue=fsm_queue),
       Mode.GUIDING:    GuidingHandler(vlm, tts, annotation_queue, initial_language),
-      Mode.ASSISTANT:  AssistantHandler(vlm, tts, recognizers, annotation_queue,  observer, initial_language, kw_flag, event_queue=fsm_queue),
+      Mode.ASSISTANT:  AssistantHandler(vlm, tts, recognizers, annotation_queue,  observer, initial_language, kw_flag, event_queue=fsm_queue, pause_frame_flag=pause_frame_flag),
       Mode.TERMINATE:  TerminateHandler(cleanup_funcs),
     }
 
