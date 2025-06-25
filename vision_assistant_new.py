@@ -135,7 +135,7 @@ def normalize_audio_buffer(buffer):
 
 
 def create_kws_model():
-    grammar = '["vision", "assistant", "computer", "caption", "watching", "language", "please", "obligation", "misunderstanding", "actually", "basically", "literally", "seriously", "honestly", "definitely", "probably", "anyway", "certainly", "absolutely", "ultimately", "eventually", "genuinely", "ostensibly", "apparently", "evidently", "naturally", "obviously", "remarkably", "specifically", "especially", "importantly", "consequently", "subsequently", "furthermore", "meanwhile", "nonetheless", "regardless", "wherever", "whenever", "however", "therefore", "although", "whereas", "unless", "besides", "indeed", "merely", "simply", "barely", "hardly", "seldom", "rarely", "always", "usually", "often", "hardly", "merely", "nearly", "quite", "rather", "pretty", "truly", "really", "fully", "partly", "mostly", "merely", "solely", "chiefly", "largely", "mainly", "namely", "broadly", "roughly", "mostly", "usually", "often", "seldom", "rarely", "always", "sometimes", "anyhow", "somehow", "anywhere", "somewhere", "everywhere", "nowhere", "anytime", "sometime", "everytime", "never", "forever", "today", "tomorrow", "yesterday", "tonight", "indeed", "rather", "pretty", "quite", "just", "then", "soon", "early", "late", "next", "last", "first", "final", "briefly", "suddenly", "slowly", "quickly", "hardly", "softly", "loudly", "clearly", "fairly"]'
+    grammar = '["vision", "assistant", "computer", "caption", "guiding", "watching", "language", "please", "obligation", "misunderstanding", "actually", "basically", "literally", "seriously", "honestly", "definitely", "probably", "anyway", "certainly", "absolutely", "ultimately", "eventually", "genuinely", "ostensibly", "apparently", "evidently", "naturally", "obviously", "remarkably", "specifically", "especially", "importantly", "consequently", "subsequently", "furthermore", "meanwhile", "nonetheless", "regardless", "wherever", "whenever", "however", "therefore", "although", "whereas", "unless", "besides", "indeed", "merely", "simply", "barely", "hardly", "seldom", "rarely", "always", "usually", "often", "hardly", "merely", "nearly", "quite", "rather", "pretty", "truly", "really", "fully", "partly", "mostly", "merely", "solely", "chiefly", "largely", "mainly", "namely", "broadly", "roughly", "mostly", "usually", "often", "seldom", "rarely", "always", "sometimes", "anyhow", "somehow", "anywhere", "somewhere", "everywhere", "nowhere", "anytime", "sometime", "everytime", "never", "forever", "today", "tomorrow", "yesterday", "tonight", "indeed", "rather", "pretty", "quite", "just", "then", "soon", "early", "late", "next", "last", "first", "final", "briefly", "suddenly", "slowly", "quickly", "hardly", "softly", "loudly", "clearly", "fairly"]'
     model = STTModel("./vosk-model-small-en-us-0.15")
     recognizer = KaldiRecognizer(model, 48000, grammar)
     return recognizer
@@ -228,7 +228,7 @@ def keyword_listener(event_queue, keyword_listening_flag, global_running_flag, c
                 print(f"[KWS] ⚠️ event_queue.put() threw: {e}")
 
         elif kw == "caption":
-            keyword_audio = []
+            keyword_audio = [] #can be moved to if not matched:
             print("[KWS] → CAPTION")
             event_queue.put(Event(EventType.KW_CAPTION))
 
@@ -658,47 +658,110 @@ class CaptioningHandler(ModeHandler):
 
 
 class GuidingHandler(ModeHandler):
-    def __init__(self, vlm_service: VLMService, tts_service: TTSService, annotation_queue, lang: str):
+    def __init__(self, vlm_service: VLMService, tts_service: TTSService, annotation_queue, lang_state):
         print("Init GuidingHandler!!")
-        print("Init GuidingHandler!!")
-
-        self.vlm = vlm_service
-        self.tts = tts_service
-        self.lang_state = lang
-        self._timer = None
-        self._latest_frame = None  # ← buffer here
+        self.vlm              = vlm_service
+        self.tts              = tts_service
         self.annotation_queue = annotation_queue
+        self.lang_state       = lang_state
 
-    
+        self._latest_frame  = None
+        self._busy          = False
+        self._stopped       = threading.Event()
+        self._thread        = None
+        self._interval      = 3.0  # seconds between guidance calls
+
+        # logging
+        self._log_entries   = []
+        self._log_filename  = None
+
     def on_language_switch(self):
         old = self.lang_state.lang
         self.lang_state.toggle()
         new = self.lang_state.lang
         print(f"[GuidingHandler] 🌐 Language: {old} → {new}")
-    
+
     def on_enter(self):
-        # every 3s grab the latest frame
-        self._timer = RepeatedTimer(3.0, self._do_caption)
+        # create a unique logfile for this guiding session
+        ts0 = int(time.time() * 1000)
+        os.makedirs("debug_guide", exist_ok=True)
+        self._log_filename = f"debug_guide/guidance_log_{ts0}.json"
+        print(f"▶ Entered GUIDING mode; logging to {self._log_filename}")
+
+        # clear previous state
+        self._log_entries.clear()
+        self._stopped.clear()
+
+        # start the periodic guidance loop
+        self._thread = threading.Thread(target=self._loop, daemon=True)
+        self._thread.start()
 
     def on_exit(self):
-        if self._timer:
-            self._timer.cancel()
-
-    def on_tts_done(self):
-        # guidance mode doesn’t use ASSISTANT_DONE events
-        pass
+        # signal the loop to stop and wait for it
+        self._stopped.set()
+        if self._thread:
+            self._thread.join(timeout=1)
 
     def on_frame(self, frame):
-    # called by the FSM on every FRAME_CAPTURED event
+        # buffer the latest frame for guidance
         self._latest_frame = frame
 
-    def _do_guidance(self):
-        if self._latest_frame is None:
-            return
-        
-        guidance_text = self.vlm.ask(self._latest_frame, text_prompt="", mode="guiding", lang=self.lang_state.lang)
-        self.tts.enqueue_speech(guidance_text, self.lang_state.lang)
-        self.annotation_queue.append(guidance_text)
+    def on_tts_done(self):
+        # not used here
+        pass
+
+    def _loop(self):
+        while not self._stopped.is_set():
+            if not self._busy and self._latest_frame is not None:
+                self._busy = True
+                try:
+                    frame = self._latest_frame
+                    ts = int(time.time() * 1000)
+
+                    # 1) save the frame
+                    frame_file = f"debug_guide/frame_{ts}.jpg"
+                    cv2.imwrite(frame_file, frame)
+                    print(f"[DEBUG] Saved image to {frame_file}")
+
+                    # 2) build prompt prefix
+                    prefix      = self.vlm._get_prefix("guiding", self.lang_state.lang)
+                    full_prompt = prefix  # no extra text
+
+                    # 3) call VLM and time it
+                    start      = time.perf_counter()
+                    guidance   = self.vlm.ask(frame, "", "guiding", self.lang_state.lang)
+                    duration   = time.perf_counter() - start
+                    print(f"[Guidance] took {duration:.2f}s → “{guidance}”")
+
+                    # 4) speak & annotate
+                    self.tts.enqueue_speech(guidance, self.lang_state.lang)
+                    self.annotation_queue.append(guidance)
+
+                    # 5) record log entry
+                    entry = {
+                        "timestamp":   ts,
+                        "frame_file":  frame_file,
+                        "prompt":      full_prompt,
+                        "guidance":    guidance,
+                        "duration_s":  duration
+                    }
+                    self._log_entries.append(entry)
+
+                    # 6) write out JSON log
+                    try:
+                        with open(self._log_filename, "w", encoding="utf-8") as f:
+                            json.dump(self._log_entries, f, ensure_ascii=False, indent=2)
+                        print(f"[DEBUG] Wrote {len(self._log_entries)} entries to {self._log_filename}")
+                    except Exception as e:
+                        print(f"[DEBUG] ❌ Failed to write JSON log: {e}")
+
+                except Exception as e:
+                    print(f"[GuidingHandler] ❌ Error during guidance: {e}")
+                finally:
+                    self._busy = False
+
+            # wait the configured interval (or until we're stopped)
+            self._stopped.wait(self._interval)
 
 
 
@@ -1440,7 +1503,7 @@ def main():
     handlers = {
       Mode.WATCHING:   WatchingHandler(lang=initial_language),
       Mode.CAPTIONING: CaptioningHandler(vlm, tts, annotation_queue, lang=initial_language),
-      Mode.GUIDING:    GuidingHandler(vlm, tts, annotation_queue, lang=initial_language),
+      Mode.GUIDING:    GuidingHandler(vlm, tts, annotation_queue, initial_language),
       Mode.ASSISTANT:  AssistantHandler(vlm, tts, recognizers, annotation_queue,  observer, initial_language, kw_flag, event_queue=fsm_queue, pause_frame_flag=pause_frame_flag, pause_audio_flag=pause_audio_flag),
       Mode.TERMINATE:  TerminateHandler(cleanup_funcs),
     }
