@@ -458,18 +458,56 @@ class VLMService:
         print("Init VLMSeervice!!")
         self.model = model
         self.captioning_prompt = {
-        "en": "Describe this image in a short single sentence. Please do not exceed 15 words in total.",
+        #PROMPT A
+        #"en": "Describe this image in a short single sentence. Please do not exceed 15 words in total.",
+        
+        #PROMPT B
+        "en": "In a single brief sentence (max. 15 words), describe what you see in this image.",
 
-        "de": "Beschreibe dieses Bild in einem einzigen kurzen Satz. Verwende auf keinen Fall mehr als insgesamt 15 Worte in deiner Antwort."
+        #PROMPT A
+        #"de": "Beschreibe dieses Bild in einem einzigen kurzen Satz. Verwende auf keinen Fall mehr als insgesamt 15 Worte in deiner Antwort."
+        
+        #PROMPT B
+        "de": "Gib das Bild in einem einzigen kurzen Satz wieder, maximal 15 Wörter."
+
+
+        
+
         }
         self.assistant_prompt = {
-        "en": "I am a visually impaired person and need assistance. I am wearing glasses which capture the image that is being provided. Please answer concisely to directly address my question based on the visual and contextual input. Do not exceed 25 words in total. Do not mention my visual impairment or the camera's fisheye lens. My question is:\n",
-        "de": "Ich bin eine sehbehinderte Person und benötige Hilfe. Ich trage eine Brille, die das bereitgestellte Bild einfängt. Bitte antworte präzise, um meine Frage anhand der visuellen und textuellen Eingaben direkt zu beantworten. Bitte nutze nicht mehr als 25 Worte für deine Antwort. Erwähne unter keinen Umständen meine Sehbehinderung. Meine Frage lautet:\n"
+
+        #PROMPT A
+        #"en": "I am a visually impaired person and need assistance. I am wearing glasses which capture the image that is being provided. Please answer concisely to directly address my question based on the visual and contextual input. Do not exceed 25 words in total. Do not mention my visual impairment or the camera's fisheye lens. My question is:\n",
+        #PROMPT B
+        "en": "You are my virtual companion and spoken navigator. I am visually impaired and wearing camera glasses that capture my view. Answer concisely (max 25 words), directly addressing my question about the image, without mentioning my impairment or the camera. My question is: ",
+
+        #PROMPT A
+        #"de": "Ich bin eine sehbehinderte Person und benötige Hilfe. Ich trage eine Brille, die das bereitgestellte Bild einfängt. Bitte antworte präzise, um meine Frage anhand der visuellen und textuellen Eingaben direkt zu beantworten. Bitte nutze nicht mehr als 25 Worte für deine Antwort. Erwähne unter keinen Umständen meine Sehbehinderung. Meine Frage lautet:\n"
+        #PROMPT B
+        "de": "Du bist mein virtueller Begleiter und Sprachnavigator. Ich bin sehbehindert und trage eine Kamerabrille, die das aktuelle Bild einfängt. Antworte kurz (max. 25 Wörter), konkret und direkt auf meine Frage zum Bildinhalt, ohne meine Behinderung oder die Kameratechnik zu erwähnen. Meine Frage ist: \n"
+
     }
-        self.guiding_prompt = {
-            "en": "IMPORTANT: Your response must be no more than 25 words. Do not exceed this limit. I am a visually impaired person and need assistance navigating my environment. I am wearing glasses that capture this image from my perspective. Please provide detailed spatial guidance including: \n - distances to objects,\n - potential obstacles or hazards,\n - directional instructions (left/right/forward),\n - and step-by-step navigation advice.\n Be specific about what I should do next. Do not mention my visual impairment or camera details",
-            #rewrite the prompts as you are [ROLE] ...
-            "de": "WICHTIG: Deine Antwort darf maximal 25 Wörter haben. Ich benötige Hilfe bei der Navigation. Ich trage eine Brille mit Kamera. Gib mir räumliche Orientierung: Entfernungen, Hindernisse, Richtungsangaben (links/rechts/vorwärts) und konkrete nächste Schritte. Erwähne nicht meine Sehbehinderung"
+        self.guiding_prompt = { 
+            
+            # PROMPT A
+            #"en": "IMPORTANT: respond in no more than 25 words. Give spatial navigation guidance: distances to objects, obstacles, left/right/forward directions, and next steps. Don’t mention my impairment or camera.",
+
+            #PROMPT B
+            "en": "Role: Spatial Guidance Assistant. You are a specialized guide providing spatial navigation: distances to objects, obstacles, left/right/forward directions, and next steps in 25 words or less. Don’t mention my impairment or camera.",
+
+            #PROMPT A
+            #"de": "WICHTIG: Deine Antwort soll max. 25 Wörter sein. Gib räumliche Orientierung: Entfernungen, Hindernisse, Links/Rechts/Vorwärts und nächste Schritte. Erwähne nicht meine Sehbehinderung."
+
+            #PROMPT B
+            "de": "Rolle: Räumlicher Navigationsassistent. Du bist ein spezialisierter Guide und gibst in maximal 25 Wörtern räumliche Orientierung: Entfernungen zu Objekten, Hindernisse, Links/Rechts/Vorwärts-Richtungen und nächste Schritte. Erwähne nicht meine Behinderung oder die Kamera."
+
+            
+            
+            
+            #old
+            #"en": "IMPORTANT: Your response must be no more than 25 words. Do not exceed this limit. I am a visually impaired person and need assistance navigating my environment. I am wearing glasses that capture this image from my perspective. Please provide detailed spatial guidance including: \n - distances to objects,\n - potential obstacles or hazards,\n - directional instructions (left/right/forward),\n - and step-by-step navigation advice.\n Be specific about what I should do next. Do not mention my visual impairment or camera details",
+            
+            #"de": "WICHTIG: Deine Antwort darf maximal 25 Wörter haben. Ich benötige Hilfe bei der Navigation. Ich trage eine Brille mit Kamera. Gib mir räumliche Orientierung: Entfernungen, Hindernisse, Richtungsangaben (links/rechts/vorwärts) und konkrete nächste Schritte. Erwähne nicht meine Sehbehinderung"
         }
 
     def _get_prefix(self, mode: str, lang: str) -> str:
