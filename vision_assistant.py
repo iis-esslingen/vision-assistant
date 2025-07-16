@@ -4,11 +4,9 @@ import os
 import json
 import time
 import subprocess
-import logger
 import queue
 from collections import deque
 import threading
-from concurrent.futures import ThreadPoolExecutor
 from vosk import Model as STTModel, KaldiRecognizer
 import argparse
 import traceback
@@ -17,11 +15,15 @@ import pyaudio
 import numpy as np
 from PIL import Image
 import cv2
-import soundfile as sf
-from TTS.api import TTS
+cv2.getBuildInformation()
 import multiprocessing
+import gc
 from tts_process import tts_worker
-
+import ollama_ifc
+from enum import Enum, auto
+from dataclasses import dataclass
+from typing import Any, Dict
+from abc import ABC, abstractmethod
 
 import aria.sdk as aria
 from projectaria_tools.core.sensor_data import (
@@ -31,68 +33,260 @@ from projectaria_tools.core.sensor_data import (
 )
 
 
-class LatestCaptionBuffer:
+
+class StreamingClientObserver:
     def __init__(self):
-        self.lock = threading.Lock()
-        self.caption = None
+        print("Init StreamingClientObserver!!")
+        self.images = {}
+        self.audio = deque(maxlen=500000)
+        self.audio_timestamps_ns = [] #makes sense to also use a deque here
 
-    def set(self, text):
-        with self.lock:
-            self.caption = text
+    def on_image_received(self, image: np.array, record: ImageDataRecord):
+        self.images[record.camera_id] = image
 
-    def get(self):
-        with self.lock:
-            return self.caption
-        
-
-
-os.environ["TOKENIZERS_PARALLELISM"] = "false"
-caption_queue = queue.Queue(maxsize=1)  # Limit the queue to 1 element to always keep the newest caption
-caption_lock = False
-audio_stopped = False
-
-audio_enabled = False
-
-audio_queue = deque(maxlen=10)  # keep latest 10 chunks
-assistant_queue = queue.Queue() #move tthis to the VAI object perhaps
-
-latest_caption_buffer = LatestCaptionBuffer()
+    def on_audio_received(
+        self,
+        audio_data: AudioData,
+        record: AudioDataRecord,
+    ):
+        self.audio.extend(audio_data.data)
+        #self.audio_timestamps_ns += record.capture_timestamps_ns
 
 
+def init_aria(args):
+    if args.verbose:
+        aria.set_log_level(aria.Level.Debug)
+    else:
+        aria.set_log_level(aria.Level.Info)
 
-
-
-def assistant_worker():
+    device_client = aria.DeviceClient()
+    client_config = aria.DeviceClientConfig()
     
-    print("Assistant worker thread started")
-    while True:
-        item = assistant_queue.get()
-        print("Assistant worker received item type:", type(item))
-        if item is None:
-            break  # Stop signal
-        
-        image, response_processor, assistant_executor, recognizer_manager, observer, args, samplerate, channels = item
-        
-        # Run VisionAssistantInteraction synchronously here
-        vision_assistant_interaction = VisionAssistantInteraction(
-            response_processor=response_processor,
-            assistant_executor=assistant_executor,
-            recognizer_manager=recognizer_manager,
-            observer=observer,
-            args=args,
-            samplerate=samplerate,
-            channels=channels,
-        )
-        
-        
-        vision_assistant_interaction.run(image)
-        
-        assistant_queue.task_done()
+    #if args.device_ip:                                 #wifi not supported in refactor
+    #    client_config.ip_v4_address = args.device_ip
+    device_client.set_client_config(client_config)
 
+    device = device_client.connect()
 
+    streaming_manager = device.streaming_manager
+    streaming_client = streaming_manager.streaming_client
 
+    streaming_config = aria.StreamingConfig()
+    streaming_config.profile_name = args.profile_name
 
-def update_iptables() -> None:
+    if args.streaming_interface == "usb": #refactor was only done on USB
+        streaming_config.streaming_interface = aria.StreamingInterface.Usb
+
+    streaming_config.security_options.use_ephemeral_certs = True
+    streaming_manager.streaming_config = streaming_config
+
+    streaming_manager.start_streaming()
+
+    streaming_state = streaming_manager.streaming_state
+    print(f"Streaming state: {streaming_state}")
+
+    observer = StreamingClientObserver()
+    streaming_client.set_streaming_client_observer(observer)
+    streaming_client.subscribe()
+
+    if args.verbose:
+        print(f"Aria Streaming profile: {streaming_config.profile_name}")
+
+    return streaming_client, device_client, observer, device, streaming_manager
+
+#plays a beep sound
+def play_keyword_sound(frequency=600, duration=0.3, samplerate=48000, volume=0.3): #TODO: store the tune np.array instead of calculating it each time
+    p = pyaudio.PyAudio()
+
+    t = np.linspace(0, duration, int(samplerate * duration), False)
+    tone = np.sin(2 * np.pi * frequency * t)
+
+    fade_length = int(0.02 * samplerate)  
+    envelope = np.ones_like(tone)
+    envelope[:fade_length] = np.linspace(0, 1, fade_length)
+    envelope[-fade_length:] = np.linspace(1, 0, fade_length)
+    soft_tone = (tone * envelope * volume).astype(np.float32)
+
+    stream = p.open(format=pyaudio.paFloat32,
+                    channels=1,
+                    rate=samplerate,
+                    output=True)
+    
+    stream.write(soft_tone.tobytes())
+    stream.stop_stream()
+    stream.close()
+    p.terminate()
+
+def normalize_audio_buffer(buffer):
+    max_sample = max(abs(min(buffer)), max(buffer))
+    if max_sample == 0:
+        return None  # Avoid division by zero
+    normalized = (np.array(buffer, dtype=np.float32) / max_sample)
+    return (normalized * 32767).astype(np.int16)
+
+def create_kws_model():
+    # The keyword list that the KWS listens for. The non-keywords serve as dilution, so as not to activate the keywords by mistake
+    grammar = '["vision", "assistant", "computer", "caption", "guiding", "watching", "language", "please", "obligation", "misunderstanding", "actually", "basically", "literally", "seriously", "honestly", "definitely", "probably", "anyway", "certainly", "absolutely", "ultimately", "eventually", "genuinely", "ostensibly", "apparently", "evidently", "naturally", "obviously", "remarkably", "specifically", "especially", "importantly", "consequently", "subsequently", "furthermore", "meanwhile", "nonetheless", "regardless", "wherever", "whenever", "however", "therefore", "although", "whereas", "unless", "besides", "indeed", "merely", "simply", "barely", "hardly", "seldom", "rarely", "always", "usually", "often", "hardly", "merely", "nearly", "quite", "rather", "pretty", "truly", "really", "fully", "partly", "mostly", "merely", "solely", "chiefly", "largely", "mainly", "namely", "broadly", "roughly", "mostly", "usually", "often", "seldom", "rarely", "always", "sometimes", "anyhow", "somehow", "anywhere", "somewhere", "everywhere", "nowhere", "anytime", "sometime", "everytime", "never", "forever", "today", "tomorrow", "yesterday", "tonight", "indeed", "rather", "pretty", "quite", "just", "then", "soon", "early", "late", "next", "last", "first", "final", "briefly", "suddenly", "slowly", "quickly", "hardly", "softly", "loudly", "clearly", "fairly"]'
+    model = STTModel("./vosk-model-small-en-us-0.15")
+    recognizer = KaldiRecognizer(model, 48000, grammar)
+    return recognizer
+
+def keyword_listener(event_queue, keyword_listening_flag, global_running_flag, cooldown_seconds=3):
+    """
+    Listens for keywords and pushes Events onto event_queue.
+    - event_queue: queue.Queue[Event]
+    - audio_queue: deque of raw audio chunks from ARIA
+    - keyword_listening_flag: multiprocessing.Value('b', True/False)
+    """
+    keywords = ['computer', 'caption', 'guiding', 'watching', 'language']
+    recognizer = create_kws_model()
+    last_switch = 0
+    keyword_audio = []
+
+    print("[KWS] Starting keyword listener…")
+    while global_running_flag.value == True:
+        # kws paused if recording audio in Assistant Mode
+        if not keyword_listening_flag.value:
+            #print("[KWS] SLEEPING DUE TO DISABLED keyword_listening_flag.value")
+            time.sleep(0.1)
+            continue
+        
+        try:
+            if audio_queue:
+                buffer = audio_queue.popleft()
+            else:
+            # sleep longer so we give the collector time to refill
+                time.sleep(0.1)
+                continue
+    
+            buffer = audio_queue.popleft()
+            keyword_audio.extend(buffer)
+        except IndexError:
+            print("KWS] EMPTY AUDIO QUEUE")
+            time.sleep(0.05)
+            continue
+        
+        #this trims the keyword buffer, so that only fresh audio chunks are considered for KWS
+        if len(keyword_audio) > 24000:
+            keyword_audio = keyword_audio[-24000:]
+
+        try:
+            audio_buffer = normalize_audio_buffer(keyword_audio) #recognizer needs the audio to be normalized
+        except Exception:
+            print("[KWS] 🔴 Error normalizing audio buffer")
+            traceback.print_exc()
+            continue  
+            
+
+        # feed into recognizer
+        if not recognizer.AcceptWaveform(audio_buffer.tobytes()):
+            #print("Sleeping due to recognizer not AcceptWaveForm")
+            time.sleep(0.02)
+            continue
+
+        result = json.loads(recognizer.Result())
+        text = result.get("text", "").lower()
+        #print("KWS RECOGNITION RESULTS: ", text)
+        matched = [kw for kw in keywords if kw in text]
+        if not matched:
+            continue
+
+        now = time.time()
+        if now - last_switch < cooldown_seconds: #prevents back-to-back keyword activations
+            continue
+        last_switch = now
+        # fire exactly one event per iteration
+        kw = matched[0]
+        
+
+        if kw == "computer":
+            print("[KWS] → COMPUTER")
+            play_keyword_sound()
+
+            print("[KWS] about to queue event KW_COMPUTER…")
+            try:
+                event_queue.put(Event(EventType.KW_COMPUTER))
+                print(f"[KWS] queued event, queue size now {event_queue.qsize()}")
+            except Exception as e:
+                print(f"[KWS] ⚠️ event_queue.put() threw: {e}")
+
+        elif kw == "caption":
+            keyword_audio = [] 
+            print("[KWS] → CAPTION")
+            event_queue.put(Event(EventType.KW_CAPTION))
+
+        elif kw == "guiding":
+            keyword_audio = []
+            print("[KWS] → GUIDANCE")
+            event_queue.put(Event(EventType.KW_GUIDANCE))
+
+        elif kw == "watching":
+            keyword_audio = []
+            print("[KWS] → WATCHING")
+            event_queue.put(Event(EventType.WATCHING))
+
+        elif kw == "language":
+            keyword_audio = []
+            print("[KWS] → LANGUAGE_SWITCH")
+            event_queue.put(Event(EventType.LANGUAGE_SWITCH))
+
+        recognizer.Reset()
+
+        # tiny sleep to avoid tight loop
+        time.sleep(0.1)
+
+def start_tts_process(global_running_flag):
+    queue = multiprocessing.Queue()
+    keyword_listening_flag = multiprocessing.Value('b', True)
+    tts_enabled_flag = multiprocessing.Value('b', True)   
+    process = multiprocessing.Process(target=tts_worker, args=(queue, keyword_listening_flag, tts_enabled_flag, global_running_flag))
+    process.start()
+    return queue, process, keyword_listening_flag, tts_enabled_flag
+
+def parse_args():
+    parser = argparse.ArgumentParser(
+        description="Vision assistant that helps interacting with the environment using the Aria glasses."
+    )
+    parser.add_argument(
+        "--interface",
+        dest="streaming_interface",
+        type=str,
+        required=False,
+        default="wifi",
+        choices=["usb", "wifi"], #only usb is supported in the refactored version!!!
+        help="Type of interface to use for streaming. Options are usb or wifi.",
+    )
+    
+    parser.add_argument(
+        "-p",
+        "--profile",
+        dest="profile_name",
+        type=str,
+        required=False,
+        default="profile18",
+        help="Profile to be used for streaming.",
+    )
+    parser.add_argument( #this is needed if you want to run Aria wireless on Linux
+        "--update-iptables",
+        dest="update_iptables",
+        action="store_true",
+        required=False,
+        default=False,
+        help="Update iptables to enable receiving the data stream, only for Linux.",
+    )
+    
+    parser.add_argument(
+        "-v",
+        "--verbose",
+        dest="verbose",
+        action="store_true",
+        required=False,
+        default=False,
+        help="Get Aria debug information on the console.",
+    )
+    return parser.parse_args()
+
+def update_iptables() -> None: #not needed if using usb-interface
     """
     Update firewall to permit incoming UDP connections for DDS
     """
@@ -115,761 +309,397 @@ def update_iptables() -> None:
     subprocess.run(update_iptables_cmd)
 
 
-def quit_keypress():
-    key = cv2.waitKey(1)
-    # Press ESC, 'q'
-    return key == 27 or key == ord("q")
-
-
-'''
-def tts_speaker():
-    print("TTS speaker thread started")
-    p = pyaudio.PyAudio()
-
-    while True:
-        item = tts_queue.get()
-        if item is None:
-            break
-        text, lang = item
-        engine = tts_engine_en if lang == "en" else tts_engine_de
-        audio = engine.tts(text, split_sentences=False)
-
-        # Play using pyaudio
-        stream = p.open(format=pyaudio.paFloat32, channels=1, rate=24000, output=True)
-        stream.write(np.array(audio, dtype=np.float32).tobytes())
-        stream.close()
-        tts_queue.task_done()
-
-    p.terminate()
-
-
-# Function to initialize TTS and start threading
-def init_tts_engine():
-    # Start the caption worker thread
-    worker_thread = threading.Thread(target=speak_caption_worker, daemon=True)
-    worker_thread.start()
-    return None  # No need for further initialization
-
-
-def tts_speaker(): ##if thread starts for the very first time, the downloading of the model starts mid programme loop, which is wacky
-    print("Starting TTS speaker thread...")
-    
-
-    try:
-       tts_engine_en = TTS(model_name="tts_models/en/ljspeech/fast_pitch", progress_bar=True, gpu=False)
-       tts_engine_de = TTS(model_name="tts_models/de/css10/vits-neon", progress_bar=True, gpu=False)
-       dummy_audio = tts_engine_en.tts("This is a dummy audio to warm up the TTS engine.", split_sentences=False)
-
-    except Exception as e:
-        print(f"❌ Failed to initialize TTS engines: {e}")
-        import traceback
-        traceback.print_exc()  
-        return
-
-    while True:
-        try:
-            item = tts_queue.get()
-            if item is None:
-                break  # Graceful shutdown
-
-            text, text_language = item
-            tts_engine = tts_engine_en if text_language == "en" else tts_engine_de
-
-            speak(text, tts_engine)
-
-        except Exception as e:
-            print(f"❌ TTS speaker thread encountered an error: {e}")
-        
-        finally:
-            tts_queue.task_done()
-
-'''
-            
-# Function to run macOS 'say' command in a separate thread and speak captions sequentially
-def speak(spoken_text, tts_engine):
-    print("Speaking:")
-
-    print("Speaking:")
-    print("Speaking:")
-    print("Speaking:")
-    print("Speaking:")
-
-    # Generate speech audio
-    audio = tts_engine.tts(spoken_text, split_sentences=False)
-
-    # Ensure float32
-    audio = np.array(audio, dtype=np.float32)
-
-    print("about to play audio:")
-    print("about to play audio:")
-    # Initialize PyAudio
-    p = pyaudio.PyAudio() #pyaudio should not be initialized at each call
-    stream = p.open(format=pyaudio.paFloat32,
-                    channels=1,
-                    rate=24000,
-                    output=True)
-    
-    print("audio played by pyaudi")
-
-    stream.write(audio.tobytes())
-
-    stream.stop_stream()
-    stream.close()
-    p.terminate()
-
-
-
-'''
-def speak_caption_worker():
-    global audio_stopped
-
-    tts_engine_en = TTS(
-        model_name="tts_models/en/ljspeech/glow-tts",
-        progress_bar=True,
-        gpu=False,
-    )
-
-    tts_engine_de = TTS(
-        model_name="tts_models/de/thorsten/vits",
-        progress_bar=True,
-        gpu=False,
-    )
-
-    while True:
-        # Get the next caption from the queue
-        caption = caption_queue.get()
-        if caption is None:
-            break  # Exit the worker thread
-        audio_stopped = False
-
-        # Speak the caption using 'say' command only if audio is enabled
-        if audio_enabled:
-            if language == "de":
-                audio = tts_engine_de.tts(caption)
-            elif language == "en":
-                audio = tts_engine_en.tts(caption)
-            else:
-                audio = np.array((0), dtype=np.float32)
-
-            # Play the audio as long as it is not stopped elsewhere
-            if not audio_stopped:  #change to pyaudio later
-                sd.play(audio, samplerate=22050)
-                sd.wait()
-
-        # Mark the task as done
-        caption_queue.task_done()
-'''
-
-
-
-
-
-# Generate the response of the model based on the frame and prompt
-
-
-
-def replace_umlaute(text: str) -> str:
-    """
-    Replaces German special characters and others that can't
-    be displayed by OpenCV with substitute characters.
-    """
-    return (
-        text.replace("ä", "ae")
-        .replace("Ä", "Ae")
-        .replace("ö", "oe")
-        .replace("Ö", "Oe")
-        .replace("ü", "ue")
-        .replace("Ü", "Ue")
-        .replace("ß", "ss")
-        .replace("\n", " ")
-    )
-
-
-# Function to split the text into multiple lines that fit within the image width
-def wrap_text(text, font, font_scale, thickness, img_width):
-    words = text.split(" ")
-    lines = []
-    current_line = ""
-
-    for word in words:
-        # Calculate the width of the current line if we add this word
-        text_size, _ = cv2.getTextSize(current_line + word, font, font_scale, thickness)
-        line_width = text_size[0]
-
-        # If the current line width exceeds the image width, start a new line
-        if line_width > img_width - 20:  # 20 is the padding
-            lines.append(current_line)
-            current_line = word + " "  # Start a new line with the current word
-        else:
-            current_line += word + " "
-
-    # Append the last line
-    if current_line:
-        lines.append(current_line.strip())
-
-    return lines
-
-
-# Function to add transparent rectangle with multiline text at the bottom of the frame
-def add_caption_to_frame(
-    frame,
-    font=cv2.FONT_HERSHEY_SIMPLEX,
-    font_scale=0.7,
-    thickness=1,
-):
-    try:
-        caption = caption_queue.queue[-1]  # Peek without removing
-    except IndexError:
-        return frame  # No caption to add
-
-    img_height, img_width, _ = frame.shape
-    caption = latest_caption_buffer.get()
-    if not caption:
-        return frame
-    
-    caption = replace_umlaute(caption)
-    lines = wrap_text(caption, font, font_scale, thickness, img_width)
-
-    text_height = cv2.getTextSize("Test", font, font_scale, thickness)[0][1]
-    line_spacing = 5
-    total_text_height = len(lines) * (text_height + line_spacing)
-
-    rect_x1, rect_y1 = 0, img_height - total_text_height - 50
-    rect_x2, rect_y2 = img_width, img_height
-
-    overlay = frame.copy()
-    cv2.rectangle(overlay, (rect_x1, rect_y1), (rect_x2, rect_y2), (255, 255, 255), -1)
-    alpha = 0.6
-    frame = cv2.addWeighted(overlay, alpha, frame, 1 - alpha, 0)
-
-    y_offset = img_height - total_text_height - 15
-    for line in lines:
-        text_size, _ = cv2.getTextSize(line, font, font_scale, thickness)
-        text_width = text_size[0]
-        text_x = (img_width - text_width) // 2
-        cv2.putText(
-            frame,
-            line,
-            (text_x, y_offset),
-            font,
-            font_scale,
-            (0, 0, 0),
-            thickness,
-            cv2.LINE_AA,
-        )
-        y_offset += text_height + line_spacing
-
-    return frame
-
-
-
-# Function to add a new caption to the queue (replace the old one if the queue is full)
-def add_caption_to_queue(caption):
-    try:
-        caption_queue.get_nowait()  # Clear previous caption if any
-    except queue.Empty:
-        pass
-    caption_queue.put(caption)
-
-
-
-def empty_and_lock_queue():
-    global caption_lock
-    caption_lock = True
-    while not caption_queue.empty():
-        caption_queue.get_nowait()
-
-
-'''
-def stop_audio():
-    global audio_stopped
-    audio_stopped = True
-    sd.stop()
-'''
-
-
-def transcribe_audio(recognizer, audio_buffer):
-    """
-    Transcribes the recorded audio into text (STT).
-    """
-    print("Transcribing...")
-    audio_data = (audio_buffer * 32767).astype(np.int16)
-    audio_data = audio_data.tobytes()
-    if not recognizer.AcceptWaveform(audio_data):
-        print(
-            "Transcription error due to not accepted waveform."
-        )  # TODO check why this is always the case
-    result = json.loads(recognizer.Result()).get("text", "")
-    print("Transcription complete. You said:\n", result)
-    return result
-
-
-# Function to display available key commands
-def display_help():
-    print("\nAvailable Key Commands:")
-    print("'q' : Quit the application.")
-    print("'x' : Activate camera only mode.")
-    print("'c' : Activate captioning mode.")
-    print("'v' : Activate vision assistant mode.")
-    #print("'o' : While in vision assistant mode, start listening.")
-    #print("'p' : While in vision assistant mode, stop listening.")
-    print("'l' : Toggle language.")
-    print("'a' : Toggle audio on/off.")
-    print("'1' : Switch the camera.")
-    print("'h' : Display this help message.\n")
-
-def play_prompt_audio(data, samplerate):
-    sf.write("debug_prompt_audio.wav", data, samplerate)  #for debugging
-
-    if data.dtype != np.float32:
-        data = data.astype(np.float32)
-    p = pyaudio.PyAudio()                   # TODO: 2 instances of pyaudio -> work with 1 instance instead
-
-    stream = p.open(format=pyaudio.paFloat32,
-                    channels=1 if data.ndim == 1 else data.shape[1],
-                    rate=samplerate,
-                    output=True)
-
-    stream.write(data.tobytes())
-
-    stream.stop_stream()
-    stream.close()
-    p.terminate()
-    
-
-def play_keyword_sound(frequency=600, duration=0.3, samplerate=48000, volume=0.3):
-    p = pyaudio.PyAudio()
-
-    t = np.linspace(0, duration, int(samplerate * duration), False)
-    tone = np.sin(2 * np.pi * frequency * t)
-
-    # Apply fade-in and fade-out envelope
-    fade_length = int(0.02 * samplerate)  # 20 ms fade
-    envelope = np.ones_like(tone)
-    envelope[:fade_length] = np.linspace(0, 1, fade_length)
-    envelope[-fade_length:] = np.linspace(1, 0, fade_length)
-    soft_tone = (tone * envelope * volume).astype(np.float32)
-
-    stream = p.open(format=pyaudio.paFloat32,
-                    channels=1,
-                    rate=samplerate,
-                    output=True)
-    
-    stream.write(soft_tone.tobytes())
-    stream.stop_stream()
-    stream.close()
-    p.terminate()
-
-
-def start_tts_process():
-    queue = multiprocessing.Queue()
-    keyword_listening_flag = multiprocessing.Value('b', True)
-    tts_enabled_flag = multiprocessing.Value('b', True)   
-    process = multiprocessing.Process(target=tts_worker, args=(queue, keyword_listening_flag, tts_enabled_flag))
-    process.start()
-    return queue, process, keyword_listening_flag, tts_enabled_flag
-
-
-
-
-def normalize_audio_buffer(buffer):
-    max_sample = max(abs(min(buffer)), max(buffer))
-    if max_sample == 0:
-        return None  # Avoid division by zero
-    normalized = (np.array(buffer, dtype=np.float32) / max_sample)
-    return (normalized * 32767).astype(np.int16)
-
-
-
-def create_kws_model():
-    grammar = '["vision", "assistant", "computer", "caption", "observer", "language", "please", "obligation", "misunderstanding", "actually", "basically", "literally", "seriously", "honestly", "definitely", "probably", "anyway", "certainly", "absolutely", "ultimately", "eventually", "genuinely", "ostensibly", "apparently", "evidently", "naturally", "obviously", "remarkably", "specifically", "especially", "importantly", "consequently", "subsequently", "furthermore", "meanwhile", "nonetheless", "regardless", "wherever", "whenever", "however", "therefore", "although", "whereas", "unless", "besides", "indeed", "merely", "simply", "barely", "hardly", "seldom", "rarely", "always", "usually", "often", "hardly", "merely", "nearly", "quite", "rather", "pretty", "truly", "really", "fully", "partly", "mostly", "merely", "solely", "chiefly", "largely", "mainly", "namely", "broadly", "roughly", "mostly", "usually", "often", "seldom", "rarely", "always", "sometimes", "anyhow", "somehow", "anywhere", "somewhere", "everywhere", "nowhere", "anytime", "sometime", "everytime", "never", "forever", "today", "tomorrow", "yesterday", "tonight", "indeed", "rather", "pretty", "quite", "just", "then", "soon", "early", "late", "next", "last", "first", "final", "briefly", "suddenly", "slowly", "quickly", "hardly", "softly", "loudly", "clearly", "fairly"]'
-    model = STTModel("./vosk-model-small-en-us-0.15")
-    recognizer = KaldiRecognizer(model, 48000, grammar)
-    return recognizer
-
-
-
-def keyword_listener(response_processor): # TODO: refactor further
-    
-    keywords = ['computer', 'caption', 'observer', 'language']
-    keyword_audio = []
-    
-    kws_recognizer = create_kws_model()
-
-    print("[KWS-LISTENER-THREAD] Starting keyword listener...")
-
-    last_switch_time = 0
-    cooldown_seconds = 2
-
-    while True:
-        if not response_processor.is_keyword_listening():
-            time.sleep(0.1)
-            continue
-        
-        try:
-            if audio_queue:
-                keyword_audio.extend(audio_queue.popleft())
-
-            #skip data if no data yet
-            if not keyword_audio:
-                continue
-
-            # Trim buffer, > 48000 was the value before
-            if len(keyword_audio) > 24000:
-                keyword_audio = keyword_audio[-24000:]
-
-            audio_data = normalize_audio_buffer(keyword_audio)
-
-            if kws_recognizer.AcceptWaveform(audio_data.tobytes()):
-                final_result = json.loads(kws_recognizer.Result())
-                text = final_result.get("text", "").lower()
-                print("[KWS-LISTENER-THREAD] Keyword recognition result as non-json:", text)
-            
-
-                matched = [kw for kw in keywords if kw in text]
-                if not matched:
-                    continue
-
-                current_time = time.time()
-                if current_time - last_switch_time < cooldown_seconds:
-                    print("[KWS-LISTENER-THREAD] Skipped trigger due to cooldown")
-                    continue
-                    
-                
-                if "computer" in matched:
-                    print("[KWS-LISTENER-THREAD] 🟢 Keyword 'computer' detected! Switching to assisting mode...")
-                    play_keyword_sound()
-                    response_processor.set_mode("assisting")
-                                    
-                        
-                elif "caption" in matched:
-                    print("[KWS-LISTENER-THREAD] 🟢 Keyword 'caption' detected! Switching to captioning mode...")
-                    response_processor.set_mode("captioning")
-
-                elif "language" in text:
-                    new_lang = "de" if response_processor.language == "en" else "en"
-                    response_processor.set_language(new_lang)
-                    print(f"[KWS-LISTENER-THREAD] 🌐 Language switched to: {response_processor.language}")
-
-                elif "observer" in text:
-                    print("[KWS-LISTENER-THREAD] Watching mode is active.")
-                    response_processor.set_mode("watching")
-
-            else:
-                time.sleep(0.3)
-
-        except Exception:
-            print("[KWS-LISTENER-THREAD] 🔴 Exception in keyword_listener:")
-            traceback.print_exc()
-
-
-
-
-
-
-
-class RecognizerManager:
-    def __init__(self, samplerate):
-        self.samplerate = samplerate
-        self.models = {
-            "en": STTModel("./vosk-model-en-us-0.22"),
-            "de": STTModel("./vosk-model-de-0.21"),
-        }
-        self.recognizers = {
-            lang: KaldiRecognizer(model, samplerate)
-            for lang, model in self.models.items()
-        }
-
-    def get_recognizer(self, language_code: str = "en"):
-        return self.recognizers.get(language_code, self.recognizers["en"])
-
-
-class ResponseStateProcessor:
-    
-    captioning_prompt = {
-        "en": "Describe this image in a short single sentence. Please do not exceed 15 words in total.",
-        "de": "Beschreibe dieses Bild in einem einzigen kurzen Satz. Verwende auf keinen Fall mehr als insgesamt 15 Worte in deiner Antwort."
-    }
-    assistant_prompt = {
-        #"en": "IMPORTANT: Your response must be no more than 40 words. Do not exceed this limit. I am a visually impaired person and need assistance navigating my environment. I am wearing glasses that capture this image from my perspective. Please provide detailed spatial guidance including: \n - distances to objects,\n - potential obstacles or hazards,\n - directional instructions (left/right/forward),\n - and step-by-step navigation advice.\n Be specific about what I should do next. Do not mention my visual impairment or camera details. My question is:\n",
-        "en": "I am a visually impaired person and need assistance. I am wearing glasses which capture the image that is being provided. Please answer concisely to directly address my question based on the visual and contextual input. Do not exceed 25 words in total. Do not mention my visual impairment or the camera's fisheye lens. My question is:\n",
-        "de": "Ich bin eine sehbehinderte Person und benötige Hilfe. Ich trage eine Brille, die das bereitgestellte Bild einfängt. Bitte antworte präzise, um meine Frage anhand der visuellen und textuellen Eingaben direkt zu beantworten. Bitte nutze nicht mehr als 25 Worte für deine Antwort. Erwähne unter keinen Umständen meine Sehbehinderung. Meine Frage lautet:\n"
-    }
-
-    def __init__(self, model, mode, tts_queue, language, kws_flag, tts_enabled_flag, add_caption_func):
+class TTSService: #purpose: queue text-to-be-spoken for the tts process
+    def __init__(self, tts_queue, tts_enabled_flag):
+        print("Init TTSService!!")
+        self._queue = tts_queue
+        self._enabled = tts_enabled_flag
+
+    def enqueue_speech(self, text: str, lang: str):
+        """Enqueue text if TTS isn’t muted."""
+        if not self._enabled.value:
+            return
+        print(f"[TTSService] → {text!r} ({lang})")
+        self._queue.put((text, lang))
+
+class VLMService:
+    def __init__(self, model):
+        print("Init VLMSeervice!!")
+        print("Init VLMSeervice!!")
         self.model = model
-        self.mode = mode
-        self.tts_queue = tts_queue
-        self.language = language
-        self.add_caption_func = add_caption_func
-        self.keyword_listening_flag = kws_flag
-        self.tts_enabled_flag = tts_enabled_flag
-        self.assistant_processing = False
-
-
+        self.captioning_prompt = { #prompt variation might yield different vlm responses
+        #PROMPT A
+        #"en": "Describe this image in a short single sentence. Please do not exceed 15 words in total.",
         
+        #PROMPT B
+        "en": "In a single brief sentence (max. 15 words), describe what you see in this image.",
 
-    def set_mode(self, new_mode):
-        print(f"🔁 Switching mode to: {new_mode}")
-        self.mode = new_mode
-
-    def set_language(self, new_language):
-        print(f"🌐 Language set to: {new_language}")
-        self.language = new_language
-
-    def ask_model(self, frame, prompt, mode):
-        lang = (self.language or "en").strip().lower()
-        if lang not in self.captioning_prompt:
-            lang = "en"
-        if mode == "captioning":
-            full_prompt = self.captioning_prompt[lang]
-        elif mode == "assisting":
-            full_prompt = self.assistant_prompt[lang] + prompt
-
-        if mode == "watching":
-            print("🟢 Skipping model call in 'watching' mode.")
-            return None  #
+        #PROMPT A
+        #"de": "Beschreibe dieses Bild in einem einzigen kurzen Satz. Verwende auf keinen Fall mehr als insgesamt 15 Worte in deiner Antwort."
         
+        #PROMPT B
+        "de": "Gib das Bild in einem einzigen kurzen Satz wieder, maximal 15 Wörter."
+        
+        }
 
-        print(f"DEBUG: language={lang}")
-        print("DEBUG: full_prompt =", full_prompt)
+        self.assistant_prompt = {
 
-        pil_image = Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
-        #debug image
-        pil_image.save("prompt_debug_image.jpg")  # Save for debugging
+        #PROMPT A
+        #"en": "I am a visually impaired person and need assistance. I am wearing glasses which capture the image that is being provided. Please answer concisely to directly address my question based on the visual and contextual input. Do not exceed 25 words in total. Do not mention my visual impairment or the camera's fisheye lens. My question is:\n",
+        #PROMPT B
+        "en": "You are my virtual companion and spoken navigator. I am visually impaired and wearing camera glasses that capture my view. Answer concisely (max 25 words), directly addressing my question about the image, without mentioning my impairment or the camera. My question is: ",
 
-        result = self.model.ask(pil_image, prompt=full_prompt)
-        return result
+        #PROMPT A
+        #"de": "Ich bin eine sehbehinderte Person und benötige Hilfe. Ich trage eine Brille, die das bereitgestellte Bild einfängt. Bitte antworte präzise, um meine Frage anhand der visuellen und textuellen Eingaben direkt zu beantworten. Bitte nutze nicht mehr als 25 Worte für deine Antwort. Erwähne unter keinen Umständen meine Sehbehinderung. Meine Frage lautet:\n"
+        #PROMPT B
+        "de": "Du bist mein virtueller Begleiter und Sprachnavigator. Ich bin sehbehindert und trage eine Kamerabrille, die das aktuelle Bild einfängt. Antworte kurz (max. 25 Wörter), konkret und direkt auf meine Frage zum Bildinhalt, ohne meine Behinderung oder die Kameratechnik zu erwähnen. Meine Frage ist: \n"
 
-    def enqueue_speech(self, text, language):
-        print(f"📥 Enqueuing speech: {text} (lang={language})")
-        self.tts_queue.put((text, language))
+    }
+        self.guiding_prompt = { 
+            
+            # PROMPT A
+            #"en": "IMPORTANT: respond in no more than 25 words. Give spatial navigation guidance: distances to objects, obstacles, left/right/forward directions, and next steps. Don’t mention my impairment or camera.",
+
+            #PROMPT B
+            "en": "Role: Spatial Guidance Assistant. You are a specialized guide providing spatial navigation: distances to objects, obstacles, left/right/forward directions, and next steps in 25 words or less. Don’t mention my impairment or camera.",
+
+            #PROMPT A
+            #"de": "WICHTIG: Deine Antwort soll max. 25 Wörter sein. Gib räumliche Orientierung: Entfernungen, Hindernisse, Links/Rechts/Vorwärts und nächste Schritte. Erwähne nicht meine Sehbehinderung."
+
+            #PROMPT B
+            "de": "Rolle: Räumlicher Navigationsassistent. Du bist ein spezialisierter Guide und gibst in maximal 25 Wörtern räumliche Orientierung: Entfernungen zu Objekten, Hindernisse, Links/Rechts/Vorwärts-Richtungen und nächste Schritte. Erwähne nicht meine Behinderung oder die Kamera."
+            }
+
+    def _get_prefix(self, mode: str, lang: str) -> str:
+        d = {
+            "captioning": self.captioning_prompt,
+            "assisting":  self.assistant_prompt,
+            "guiding":    self.guiding_prompt
+        }[mode]
+        return d.get(lang, d["en"])
+
+    def ask(self, frame: np.ndarray, text_prompt: str, mode: str, lang: str) -> str:
+        """
+        mode in {"captioning","assisting","guiding"}.
+        text_prompt is extra text (e.g. the transcript in 'assisting').
+        """
+        prefix = self._get_prefix(mode, lang)
+        full_prompt = prefix + (text_prompt or "")
+        print("[VLM SERVICE] - passing full prompt into vlm: ", full_prompt)
+        # convert OpenCV frame to PIL if your model needs
+        pil = Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
 
 
-    def set_tts_enabled(self, enabled: bool):
-        print(f"{'🔇 Pausing' if not enabled else '🔊 Resuming'} TTS playback")
-        self.tts_enabled_flag.value = enabled
+        # ─── DEBUG: dump PIL to disk ───
+        '''
+        os.makedirs("debug_pil", exist_ok=True)
+        debug_path = f"debug_pil/frame_for_vlm_{int(time.time()*1000)}.jpg"
+        pil.save(debug_path, format="JPEG")
+        print(f"[DEBUG] Saved PIL image to {debug_path}")
+        '''
+        
+        return self.model.ask(pil, prompt=full_prompt)
 
+class ModeHandler(ABC): #base abstract class for all Handlers
+    @abstractmethod
+    def on_enter(self):
+        """Called once when the FSM transitions *into* this mode."""
+        raise NotImplementedError
 
-    def is_keyword_listening(self):
-        return self.keyword_listening_flag.value
+    @abstractmethod
+    def on_exit(self):
+        """Called once when the FSM transitions *out of* this mode."""
+        raise NotImplementedError
+
+    @abstractmethod
+    def on_frame(self, frame):
+        """
+        Called on each new camera frame *if* this mode cares about frames.
+        frame is your raw image data (e.g. numpy array).
+        """
+        raise NotImplementedError
+
+    @abstractmethod
+    def on_tts_done(self):
+        """
+        Called when the TTSService emits an ASSISTANT_DONE event,
+        so you can clean up or transition back to “watching.”
+        """
+        raise NotImplementedError
+        
+    def on_language_switch(self):
+        """Called whenever the user says 'language' in *any* mode."""
+        pass
+
+class WatchingHandler(ModeHandler): #WatchingHandler is a Neutral State - it does nothing
+    def __init__(self, lang):
+        print("Init WatchingHandler!!")
+        print("Init WatchingHandler!!")
+        self.lang_state = lang
+
     
-    def disable_keyword_listening(self):
-        print("🛑 Disabling keyword listening...")
-        self.keyword_listening_flag.value = False
+    def on_language_switch(self):
+        old = self.lang_state.lang
+        self.lang_state.toggle()
+        new = self.lang_state.lang
+        print(f"[WatchingHandler] Language: {old} → {new}")
 
-    def enable_keyword_listening(self):
-        print("🟢 Enabling keyword listening...")
-        self.keyword_listening_flag.value = True
+    def on_enter(self):
+        print("▶ Now watching (idle).")
+
+    def on_exit(self):
+        print("◀ Leaving watch mode.")
+
+    def on_frame(self, frame):
+        pass
+
+    def on_tts_done(self):
+        pass
+
+class CaptioningHandler(ModeHandler):
+    def __init__(self, vlm_service: VLMService, tts_service: TTSService, annotation_queue, lang: str):
+        print("Init CaptioningHandler!!")
+        print("Init CaptioningHandler!!")
+        self.vlm = vlm_service
+        self.tts = tts_service
+        self.lang_state = lang
+        self._timer = None
+        self._latest_frame = None  # must be overwritten
+        self.annotation_queue = annotation_queue
+        
+        self._busy       = False
+        self._stopped    = threading.Event()
+        self._thread     = None
+        self._interval   = 3
+
+    def on_language_switch(self):
+        old = self.lang_state.lang
+        self.lang_state.toggle()
+        new = self.lang_state.lang
+        print(f"[CaptioningHandler] Language: {old} → {new}")
+
+    def on_enter(self):
+        self._stopped.clear()
+        # immediate first caption
+        self._do_caption()
+        # then periodic loop
+        self._thread = threading.Thread(target=self._loop, daemon=True)
+        self._thread.start()
+
+    def on_exit(self):
+        # Signal the background loop to stop and wait for it
+        self._stopped.set()
+        if self._thread:
+            self._thread.join(timeout=1)
+
+    def _loop(self):
+        while not self._stopped.is_set():
+            if not self._busy and self._latest_frame is not None:
+                self._busy = True
+                try:
+                    frame = self._latest_frame
+
+                    # build prompt
+                    prefix      = self.vlm._get_prefix("captioning", self.lang_state.lang)
+                    full_prompt = prefix
+
+                    # call VLM 
+                    caption = self.vlm.ask(frame, "", "captioning", self.lang_state.lang)
+                    
+                    # speak & annotate
+                    self.tts.enqueue_speech(caption, self.lang_state.lang)
+                    self.annotation_queue.append(caption)
 
 
-    def process_frame(self, frame, language, prompt, mode):
-        """Main method that calls the model and handles the response"""
-        print("🟡 Processing frame started")
-        print("🟡 Processing frame started")
-        # save frame for debugging
-        cv2.imwrite("debug_frame.jpg", frame)  # Save the frame for debugging
-        print("With prompt: and language:", prompt, language)
+                except Exception as e:
+                    print(f"[CaptioningHandler] ❌ Error during caption: {e}")
+                finally:
+                    self._busy = False
 
+            # wait interval or until stopped
+            self._stopped.wait(self._interval)
+        
+    
+    
+
+    def on_frame(self, frame):
+        # called by the FSM on every FRAME_CAPTURED event
+        self._latest_frame = frame
+
+    def on_tts_done(self):
+        # not needed in captioning mode
+        pass
+
+    def _do_caption(self):
+        frame = self._latest_frame
+        if frame is None:
+            return
+
+        self._busy = True
         try:
-            response = self.ask_model(frame, prompt, mode)  # Your core model call
-            print("🟢 Models response:", response)
-            self.handle_response(response, language, mode)  # Process based on mode
-            return response  # Return response for caller
+            caption = self.vlm.ask(frame, "", "captioning", self.lang_state.lang)
+            print(f"[Caption] “{caption}”")
+            self.tts.enqueue_speech(caption, self.lang_state.lang)
+            self.annotation_queue.append(caption)
         except Exception as e:
-            print("🔴 Exception in process_frame:", e)
-            traceback.print_exc()
-            return None
+            print(f"[CaptioningHandler] ❌ caption error: {e}")
+        finally:
+            self._busy = False
 
-    def handle_response(self, response, language, mode):
-        self.enqueue_speech(response, language)  # Every llm response is spoken
-        if mode == "captioning":
-            self.add_caption_func("Loading caption...")
-            self.handle_caption_display(response)  # Only caption mode gets visual display
+class GuidingHandler(ModeHandler):
+    def __init__(self, vlm_service: VLMService, tts_service: TTSService, annotation_queue, lang_state):
+        print("Init GuidingHandler!!")
+        self.vlm              = vlm_service
+        self.tts              = tts_service
+        self.annotation_queue = annotation_queue
+        self.lang_state       = lang_state
 
-    def handle_caption_display(self, response):
-        try:
-            current_caption = caption_queue.queue[-1]
-            if current_caption == "Loading caption...":
-                caption_queue.get_nowait()
-        except queue.Empty:
-            pass
-
-        self.add_caption_func(response)
+        self._latest_frame  = None
+        self._busy          = False
+        self._stopped       = threading.Event()
+        self._thread        = None
+        self._interval      = 3.0  # seconds between guidance calls
 
         
 
+    def on_language_switch(self):
+        old = self.lang_state.lang
+        self.lang_state.toggle()
+        new = self.lang_state.lang
+        print(f"[GuidingHandler] Language: {old} → {new}")
 
+    def on_enter(self):
+        # clear previous state
+        self._stopped.clear()
 
+        # start the periodic guidance loop
+        self._thread = threading.Thread(target=self._loop, daemon=True)
+        self._thread.start()
 
+    def on_exit(self):
+        # signal the loop to stop and wait for it
+        self._stopped.set()
+        if self._thread:
+            self._thread.join(timeout=1)
 
+    def on_frame(self, frame):
+        # buffer the latest frame for guidance
+        self._latest_frame = frame
 
-def init_aria(args):
+    def on_tts_done(self):
+        # not used here
+        pass
 
-    if args.verbose:
-        aria.set_log_level(aria.Level.Debug)
-    else:
-        aria.set_log_level(aria.Level.Info)
+    def _loop(self):
+        while not self._stopped.is_set():
+            if not self._busy and self._latest_frame is not None:
+                self._busy = True
+                try:
+                    frame = self._latest_frame
+                    #  call VLM
+                    guidance   = self.vlm.ask(frame, "", "guiding", self.lang_state.lang)
 
-    device_client = aria.DeviceClient()
-    client_config = aria.DeviceClientConfig()
-    if args.device_ip:
-        client_config.ip_v4_address = args.device_ip
-    device_client.set_client_config(client_config)
+                    # speak & annotate
+                    self.tts.enqueue_speech(guidance, self.lang_state.lang)
+                    self.annotation_queue.append(guidance)
 
-    device = device_client.connect()
+                except Exception as e:
+                    print(f"[GuidingHandler] ❌ Error during guidance: {e}")
+                finally:
+                    self._busy = False
 
-    streaming_manager = device.streaming_manager
-    streaming_client = streaming_manager.streaming_client
-
-    streaming_config = aria.StreamingConfig()
-    streaming_config.profile_name = args.profile_name
-
-    if args.streaming_interface == "usb":
-        streaming_config.streaming_interface = aria.StreamingInterface.Usb
-
-    streaming_config.security_options.use_ephemeral_certs = True
-    streaming_manager.streaming_config = streaming_config
-
-    streaming_manager.start_streaming()
-
-    streaming_state = streaming_manager.streaming_state
-    print(f"Streaming state: {streaming_state}")
-
-    observer = StreamingClientObserver()
-    streaming_client.set_streaming_client_observer(observer)
-    streaming_client.subscribe()
-
-    if args.verbose:
-        print(f"Aria Streaming profile: {streaming_config.profile_name}")
-
-    return streaming_client, device_client, observer, device, streaming_manager
-
-def parse_args():
-    parser = argparse.ArgumentParser(
-        description="Vision assistant that helps interacting with the environment using the Aria glasses."
-    )
-    parser.add_argument(
-        "--interface",
-        dest="streaming_interface",
-        type=str,
-        required=False,
-        default="wifi",
-        choices=["usb", "wifi"],
-        help="Type of interface to use for streaming. Options are usb or wifi.",
-    )
-    parser.add_argument(
-        "--device-ip", help="IP address to connect to the device over wifi."
-    )
-    parser.add_argument(
-        "-c",
-        "--camera",
-        dest="camera_index",
-        type=int,
-        required=False,
-        default=0,
-        choices=[0, 1, 2],
-        help="0: RGB Camera, 1: SLAM1 Camera, 2: SLAM2 Camera.",
-    )
-    parser.add_argument(
-        "-p",
-        "--profile",
-        dest="profile_name",
-        type=str,
-        required=False,
-        default="profile18",
-        help="Profile to be used for streaming.",
-    )
-    parser.add_argument(
-        "--update-iptables",
-        dest="update_iptables",
-        action="store_true",
-        required=False,
-        default=False,
-        help="Update iptables to enable receiving the data stream, only for Linux.",
-    )
-    parser.add_argument(
-        "-m",
-        "--model",
-        dest="model",
-        type=str,
-        required=False,
-        default="llava",
-        help="Name of the model to use.",
-    )
-    parser.add_argument(
-        "--mlx",
-        dest="mlx",
-        action="store_true",
-        required=False,
-        default=False,
-        help="Use the mlx version of LLava.",
-    )
-    parser.add_argument(
-        "--caption-interval",
-        dest="caption_interval",
-        type=int,
-        required=False,
-        default=0,
-        help="Interval in seconds between caption updates.",
-    )
-    parser.add_argument(
-        "-v",
-        "--verbose",
-        dest="verbose",
-        action="store_true",
-        required=False,
-        default=False,
-        help="Get Aria debug information on the console.",
-    )
-    return parser.parse_args()
-
-
-
-
-
-class VisionAssistantInteraction:
-    def __init__(self, response_processor, assistant_executor, recognizer_manager, observer, args, samplerate, channels):
-        self.response_processor = response_processor
-        self.assistant_executor = assistant_executor
-        self.recognizer_manager = recognizer_manager
+            # wait the configured interval (or until we're stopped)
+            self._stopped.wait(self._interval) #this interval does not work how it's supposed to
+    
+class AssistantHandler(ModeHandler):
+    def __init__(self, vlm_service, tts_service, recognizers, annotation_queue, observer, lang, keyword_listening_flag, event_queue, pause_frame_flag, pause_audio_flag):
+        print("Init AssistantHandler!!")
+        print("Init AssistantHandler!!")
+        self.vlm = vlm_service
+        self.tts = tts_service
         self.observer = observer
-        self.args = args
-        self.samplerate = samplerate
-        self.channels = channels
+        self.lang_state = lang
+        self.event_queue = event_queue
+        self._latest_frame = None
+        self.kws_flag = keyword_listening_flag
+        self.annotation_queue = annotation_queue
+        self.samplerate = 48000
+        self.channels = 7
+        self.recognizers = recognizers
+        self.pause_frame_flag = pause_frame_flag
+        self.pause_audio_flag = pause_audio_flag
 
         
 
+        
+    def on_language_switch(self):
+        old = self.lang_state.lang
+        self.lang_state.toggle()
+        new = self.lang_state.lang
+        print(f"[AssistantHandler] Language: {old} → {new}")
     
-    def run(self, image):
-        print("Keyword COMPUTER detected, please speak your prompt")
-        self.response_processor.disable_keyword_listening()
-        
-        audio = self.record_audio_with_silence_detection()
-        
-        if audio:
-            print(f"Recorded {len(audio)} samples of audio.")
-            norm_audio, latest_instruction = self.transcribe_audio(audio)
-            
-            if self.args.verbose:
-                print("Audio data received, playing back prompt audio...")
-                play_prompt_audio(norm_audio, self.samplerate)
-            
-            print("latest_instruction result:", latest_instruction)
-        
+    def on_enter(self):
+
         
 
-        # Submit to VLM
-        #time.sleep(0.5)
-        self.submit_vlm_query(image, latest_instruction)
-        self.response_processor.enable_keyword_listening()
+        # run the assistant flow in background
+        threading.Thread(target=self._run_assistant_flow, daemon=True).start()
 
-        self.response_processor.assistant_processing = False
-        self.response_processor.set_mode("watching")
+    def on_exit(self):
+        pass
 
-    
-    def record_audio_with_silence_detection(self):
+    def on_frame(self, frame):
+        # buffer the latest frame for when we run the assistant flow
+        self._latest_frame = frame
+
+    def on_tts_done(self):
+        return super().on_tts_done()
+
+    def _run_assistant_flow(self):
+        print("STARTING ASSISTANT FLOW")
+        self.pause_audio_flag.value = True
+
+        # pause KWS
+        self.kws_flag.value = False
+        # pause frame captured events
+        self.pause_frame_flag.value = True
+        print("self.lang_state.lang is: ", self.lang_state.lang)
+        recognizer = self.recognizers.get(self.lang_state.lang, self.recognizers["en"])
+        transcript = self._record_and_transcribe(recognizer)
+        
+        self.pause_audio_flag.value = False
+        self.kws_flag.value = True
+
+        # Wait up to 0.5s for at least one on_frame() callback
+        timeout = time.time() + 1
+        while self._latest_frame is None and time.time() < timeout:
+            time.sleep(0.01)
+
+        # get the latest frame we saw
+        if self._latest_frame is None:
+            print("[AssistantHandler] ⚠️  No frame available for assistance.")
+            self.event_queue.put(Event(EventType.ASSISTANT_DONE))
+            self.pause_frame_flag.value = False
+            return
+
+        frame = self._latest_frame
+
+        print("[ASSISTANT] Asking VLM:", transcript)
+        reply = self.vlm.ask(frame, transcript, "assisting", self.lang_state.lang)
+        
+        # speak the reply
+        self.tts.enqueue_speech(reply, self.lang_state.lang)
+        self.annotation_queue.append(reply)
+
+        # notify FSM that we're done
+        self.event_queue.put(Event(EventType.ASSISTANT_DONE))
+        self.pause_frame_flag.value = False
+
+
+    #detects silence
+    def record_audio(self):
         self.observer.audio.clear()
+        
         audio = []
         start_time = time.time()
         duration = 20
@@ -878,7 +708,10 @@ class VisionAssistantInteraction:
         chunk_check_interval = 0.1
         last_chunk_time = start_time
         last_audio_activity = start_time
-        
+
+        print("Audio recording - Please speak your query")
+        print("Audio recording - Please speak your query")
+        print("Audio recording - Please speak your query")
         while time.time() - start_time < duration:
             if self.observer.audio:
                 audio.extend(self.observer.audio)
@@ -908,7 +741,8 @@ class VisionAssistantInteraction:
 
         return audio
     
-    def transcribe_audio(self, audio):
+
+    def transcribe_audio(self, audio, recognizer):
         mono_audio = audio[::self.channels]
         max_sample_value = max(abs(min(mono_audio)), max(mono_audio))
         
@@ -918,87 +752,438 @@ class VisionAssistantInteraction:
             print("⚠️ Warning: Audio normalization by zero. Using fallback normalization.")
             norm_audio = np.array(mono_audio, dtype=np.float32) / 1e-6
         
-        print(f"Listened for {round(len(audio) / self.samplerate, 1)}s.")  # accurate duration
+        audio_data = (norm_audio * 32767).astype(np.int16).tobytes()
+        if not recognizer.AcceptWaveform(audio_data):
+            print("Transcription error due to not accepted waveform.")
         
-        recognizer = self.recognizer_manager.get_recognizer(self.response_processor.language)
-        latest_instruction = transcribe_audio(recognizer, norm_audio)
+        result = json.loads(recognizer.Result()).get("text", "")
+        print("Transcription complete. You said:\n", result)
+        return result
+
+    def _record_and_transcribe(self, recognizer):
+        audio = self.record_audio()
+        transcript = self.transcribe_audio(audio, recognizer)
+        return transcript
+    
+class TerminateHandler(ModeHandler): #TerminateHandler executes at program exit - cleans up threads etc.
+    def __init__(self, cleanup_funcs):
+        print("Init TerminatedHandler!!")
+        self._cleanup = cleanup_funcs
+
+    def on_enter(self):
+        print("[TerminateHandler] Cleaning up…")
         
-        return norm_audio, latest_instruction
-    
-    def submit_vlm_query(self, image, instruction):
-        response_future = self.assistant_executor.submit(
-            self.response_processor.process_frame,
-            frame=image,
-            language=self.response_processor.language,
-            prompt=instruction,
-            mode = self.response_processor.mode
-            
-        )
-        print("Future object:", response_future)
+        for fn in self._cleanup:
+            try:
+                fn()
+            except Exception as e:
+                print(f"⚠️  Error during cleanup: {e}")
+                
+        items_cleared = gc.collect()
+        print("Cleanup complete!")
+        print("Items_cleared:", items_cleared)
+
         
-        if self.response_processor.language == "en":
-            self.response_processor.enqueue_speech("Processing", language="en")
-        elif self.response_processor.language == "de":
-            self.response_processor.enqueue_speech("In Bearbeitung", language="de")
-    
+    def on_exit(self):
+        print("Shutting down!")
+
+    def on_frame(self, frame):
+        pass
+
+    def on_tts_done(self):
+        pass
+
+class Mode(Enum):
+    WATCHING   = auto()
+    GUIDING    = auto()
+    ASSISTANT  = auto()
+    CAPTIONING = auto()
+    TERMINATE  = auto()
+
+class EventType(Enum): #Event Definitions
+    KW_COMPUTER         = auto()
+    KW_CAPTION          = auto()
+    KW_GUIDANCE         = auto()
+    WATCHING            = auto()
+    ASSISTANT_DONE      = auto()
+    LANGUAGE_SWITCH     = auto()
+    FRAME_CAPTURED      = auto()
+    QUIT                = auto()
+
+@dataclass
+class Event:
+    type: EventType
+    payload: Any = None #Event FRAME_CAPTURED is the only event that carries a payload, which is the frame data
+
+def load_vlm_model():
+        model_name = "llava"
+        print(f"Using model: {model_name}")
+        return ollama_ifc.OllamaVLM(model_name)
+        
 
 
-    
+#FSM = Finite State Machine Engine
+class FSMEngine: # central mechanism to handle the transitions between the different modes, reacts to events and calls the appropriate handlers
+    def __init__(self,
+                 initial: Mode,
+                 handlers: Dict[Mode, ModeHandler], _event_queue: queue.Queue, global_running_flag):  #global_running_flag is of type "multiprocessing.Value"
+        print("Init FSMEngine")
+        self.current_mode = initial
+        self.handlers = handlers
+        self.transitions = self.define_transitions()
+        self.event_queue = _event_queue
+        self._running = False
+        self.global_running_flag = global_running_flag #idk if this does anything really
+        
+    def define_transitions(self) -> Dict[Mode, Dict[EventType, Mode]]:
+        return {
+        Mode.WATCHING: {
+            EventType.KW_COMPUTER:       Mode.ASSISTANT,
+            EventType.KW_CAPTION:        Mode.CAPTIONING,
+            EventType.KW_GUIDANCE:       Mode.GUIDING,
+            EventType.LANGUAGE_SWITCH: Mode.WATCHING,
+        },
+        Mode.CAPTIONING: {
+            EventType.WATCHING:       Mode.WATCHING,
+            EventType.KW_COMPUTER:       Mode.ASSISTANT,
+            EventType.KW_GUIDANCE:       Mode.GUIDING,
+        },
+        Mode.GUIDING: {
+            EventType.WATCHING:       Mode.WATCHING,
+            EventType.KW_CAPTION:        Mode.CAPTIONING,
+            EventType.KW_COMPUTER:       Mode.ASSISTANT,
+        },
+        Mode.ASSISTANT: {
+            EventType.ASSISTANT_DONE: Mode.WATCHING,
+        },
+        Mode.TERMINATE: {}
+        }
 
-def caption_worker(response_processor):
-    print("[CaptionWorker] 🟢 Caption worker thread started")
+    def post(self, event: Event):
+        self.event_queue.put(event)
 
-    while True:
-        try:
-            item = caption_queue.get()
-            if item is None:
-                print("[CaptionWorker] 🔴 Received shutdown signal")
+    def run(self):
+        self._running = True
+        # fire initial on_enter
+        self.handlers[self.current_mode].on_enter()
+
+        while self._running and self.global_running_flag.value: #react to events as long as the FSM is running (self._running) and the whole program is running (global_running_flag.value)
+            event = self.event_queue.get()
+            print(f"[FSM] ← Recieved event: {event.type}")
+            # global quit
+            if event.type is EventType.QUIT:
+                self._swap_to(Mode.TERMINATE)
                 break
+            
+            if event.type is EventType.LANGUAGE_SWITCH:
+                print(f"[FSM] handling LANGUAGE_SWITCH in {self.current_mode}")
+                self.handlers[self.current_mode].on_language_switch()
+                continue
 
-            frame, language = item
-            print(f"[CaptionWorker] 🟡 Received item — lang: {language}")
-
-            prompt = response_processor.captioning_prompt.get(language, response_processor.captioning_prompt["en"])
-            print(f"[CaptionWorker] 🟡 Using prompt: {prompt}")
-
-            caption = response_processor.process_frame(frame=frame, language=language, prompt=prompt, mode="captioning")
-            print(f"[CaptionWorker] 🟢 Caption generated: {caption}")
-
-            if caption:
-                latest_caption_buffer.set(caption)
-
-            caption_queue.task_done()
-
-        except Exception as e:
-            print(f"[CaptionWorker] 🔴 Exception: {e}")
+            if event.type is EventType.FRAME_CAPTURED:
+                self.handlers[self.current_mode].on_frame(event.payload)
 
 
-class StreamingClientObserver:
-    def __init__(self):
-        self.images = {}
-        self.audio = []
-        self.audio_timestamps_ns = []
+            # mode-specific transitions
+            nxt = self.transitions.get(self.current_mode, {}).get(event.type, self.current_mode)
+            if nxt is not self.current_mode:
+                self._swap_to(nxt)
+            elif event.type is EventType.ASSISTANT_DONE:
+                # let handlers execute TTS‐done if they care
+                self.handlers[self.current_mode].on_tts_done()
 
-    def on_image_received(self, image: np.array, record: ImageDataRecord):
-        self.images[record.camera_id] = image
+        # call final on_exit (e.g. TerminateHandler cleanup)
+        self.handlers[self.current_mode].on_exit()
+        self.global_running_flag.value = False
 
-    def on_audio_received(
-        self,
-        audio_data: AudioData,
-        record: AudioDataRecord,
-    ):
-        self.audio += audio_data.data
-        self.audio_timestamps_ns += record.capture_timestamps_ns
+    def _swap_to(self, new_mode: Mode):
+        print("swap to called with new mode:", new_mode)
+        self.handlers[self.current_mode].on_exit()
+        self.current_mode = new_mode
+        self.handlers[new_mode].on_enter()
+        if new_mode is Mode.TERMINATE:
+            self._running = False
+
+    def stop(self):
+        self._running = False
 
 
+
+import cv2
+import textwrap
+from collections import deque
+
+class FrameOverlay:
+    def __init__(self,
+                 caption_queue: deque,
+                 font=cv2.FONT_HERSHEY_SIMPLEX,
+                 font_scale=0.7,
+                 thickness=1,
+                 padding=10):
+        self.caption_queue = caption_queue
+        self.font = font
+        self.font_scale = font_scale
+        self.thickness = thickness
+        self.padding = padding
+
+        self.show_help_flag = False
+        self.help_text = [ #not implemented because all the commands are speech based
+            "'q': Quit",
+            "'x': Camera only",
+            "'c': Caption mode",
+            "'v': Vision assistant",
+            "'l': Toggle language",
+            "'a': Toggle audio",
+            "'1': Switch camera",
+            "'h': Toggle help"
+        ]
+
+    def toggle_help(self):
+        self.show_help_flag = not self.show_help_flag
+
+    def replace_umlaute(self, text: str) -> str:
+        return (text
+            .replace("ä", "ae").replace("Ä", "Ae")
+            .replace("ö", "oe").replace("Ö", "Oe")
+            .replace("ü", "ue").replace("Ü", "Ue")
+            .replace("ß", "ss").replace("\n", " ")
+        )
+
+    def wrap_text(self, text: str, img_width: int) -> list[str]:
+        # rough split by pixel width using char count
+        # fallback to Python's textwrap for simplicity
+        max_chars = max(1, img_width // int(20 * self.font_scale))
+        return textwrap.wrap(text, width=max_chars)
+
+    def _draw_caption(self, frame):
+        if not self.caption_queue:
+            return frame
+        try:
+            caption = self.caption_queue[-1]
+        except IndexError:
+            return frame
+
+        caption = self.replace_umlaute(caption)
+        lines = self.wrap_text(caption, frame.shape[1])
+        if not lines:
+            return frame
+
+        # Get the size of one line to compute heights
+        (text_w, text_h), baseline = cv2.getTextSize(
+        lines[0],
+        self.font,
+        self.font_scale,
+        self.thickness
+        )
+        line_h = text_h + 5
+        rect_h = line_h * len(lines) + 2 * self.padding
+        h, w = frame.shape[:2]
+        y0 = h - rect_h
+
+        # Draw semi-transparent background
+        overlay = frame.copy()
+        cv2.rectangle(
+        overlay,
+        (0, y0),
+        (w, h),
+        (255, 255, 255),
+        -1
+        )
+        frame = cv2.addWeighted(overlay, 0.6, frame, 0.4, 0)
+
+        # Draw each line, centered
+        y = y0 + self.padding + text_h
+        for line in lines:
+            (text_w, _), _ = cv2.getTextSize(
+            line,
+            self.font,
+            self.font_scale,
+            self.thickness
+        )
+            x = (w - text_w) // 2
+            cv2.putText(
+            frame,
+            line,
+            (x, y),
+            self.font,
+            self.font_scale,
+            (0, 0, 0),
+            self.thickness,
+            cv2.LINE_AA
+        )
+            y += line_h
+
+        return frame
+
+
+    def _draw_help(self, frame):
+        if not self.show_help_flag:
+            return frame
+        h, w = frame.shape[:2]
+        # semi-transparent box in top-left
+        overlay = frame.copy()
+        box_w = w // 3
+        box_h = len(self.help_text)*(20) + 2*self.padding
+        cv2.rectangle(overlay, (0,0), (box_w, box_h),
+                      (50,50,50), -1)
+        frame = cv2.addWeighted(overlay, 0.7, frame, 0.3, 0)
+        # draw text lines
+        y = self.padding + 20
+        for line in self.help_text:
+            cv2.putText(frame, line, (self.padding, y),
+                        self.font, 0.6, (255,255,255), 1, cv2.LINE_AA)
+            y += 20
+        return frame
+
+    def render(self, frame):
+        # draw caption at bottom
+        frame = self._draw_caption(frame)
+        # draw help overlay if toggled
+        frame = self._draw_help(frame)
+        return frame
+
+def frame_producer(observer,
+                   fsm_event_queue: queue.Queue,
+                   display_event_queue: queue.Queue,
+                   global_running_flag,
+                   overlay=None,
+                   pause_frame_flag=None,
+                   fps: float = 20.0):
+    """
+    Continuously:
+      • pull the latest RGB image from observer,
+      • process it (rotate + BGR→RGB),
+      • send it to the FSM as a FRAME_CAPTURED event (keeping only one in flight),
+      • send the raw frame to the display queue,
+      • sleep to maintain ~fps.
+    """
+    interval = 1.0 / fps
+    last_time = time.time()
+
+    while global_running_flag.value:
+        if pause_frame_flag.value:
+            time.sleep(0.05)
+            continue
+
+        # throttle to target fps
+        now = time.time()
+        to_sleep = interval - (now - last_time)
+        if to_sleep > 0:
+            time.sleep(to_sleep)
+        last_time = time.time()
+
+        # grab & preprocess the RGB image
+        if aria.CameraId.Rgb not in observer.images:
+            continue
+        
+        img = observer.images.pop(aria.CameraId.Rgb)
+        frame = np.rot90(img, -1)
+        frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+
+        # 3) enqueue to FSM queue, replacing only stale FRAME_CAPTURED
+        evt = Event(EventType.FRAME_CAPTURED, frame)
+        try:
+            # if queue not full, just put
+            fsm_event_queue.put_nowait(evt)
+        except queue.Full:
+            # queue is full: then peek the old event
+            old = fsm_event_queue.get_nowait()
+            if old.type != EventType.FRAME_CAPTURED:
+                # put back control events
+                fsm_event_queue.put_nowait(old)
+            # now enqueue the fresh frame
+            fsm_event_queue.put_nowait(evt)
+
+        #  publish raw frame for display (no caption)
+        display_event_queue.put(frame)
+
+        # tiny sleep
+        time.sleep(0.001)
+
+
+def display_loop(display_queue, fsm_queue, global_running_flag, overlay):
+    window = "Aria View"
+    cv2.namedWindow(window, cv2.WINDOW_NORMAL)
+
+    frame_count = 0
+    t_start     = time.perf_counter()
+
+    while global_running_flag.value:
+        try:
+            frame = display_queue.get(timeout=0.1)
+        except queue.Empty:
+            continue
+
+        frame_count += 1
+        now = time.perf_counter()
+        if now - t_start >= 1.0:
+            fps = frame_count / (now - t_start)
+            print(f"[Perf] Display FPS: {fps:.1f}")
+            frame_count = 0
+            t_start     = now
+
+        display_frame = overlay.render(frame)
+        cv2.imshow(window, display_frame)
+        if (cv2.waitKey(1) & 0xFF) == ord('q'):
+            fsm_queue.put(Event(EventType.QUIT))
+            break
+
+    cv2.destroyAllWindows()
+
+
+
+class LanguageState:
+    def __init__(self, initial: str = "en"):
+        self.lang = initial
+
+    def toggle(self):
+        self.lang = "de" if self.lang == "en" else "en"
+        print("Language switched to: ", self.lang)
+
+
+
+def load_recognizers() -> dict[str, KaldiRecognizer]:
+        model_paths = {
+        "en": "./vosk-model-en-us-0.22",
+        "de": "./vosk-model-de-0.21"
+        }
+
+        recognizers = {}
+        for lang_code, path in model_paths.items():
+            model = STTModel(path)
+            recognizer = KaldiRecognizer(model, 48000) #48khZ
+            recognizers[lang_code] = recognizer
+        
+       
+        print("LOADING RECOGNIZERS FINISHED")
+        return recognizers
+    
+
+fsm_queue = queue.Queue(maxsize=1)
+display_queue = queue.Queue()
+audio_queue = deque(maxlen=10)
 
 
 
 def main():
 
-    #tts seperate process
-    multiprocessing.set_start_method("spawn") 
-    tts_queue, tts_proc, keyword_listening_flag, tts_enabled_flag = start_tts_process()
+    global_running_flag = multiprocessing.Value('b', True)
+    tts_queue, tts_proc, kw_flag, tts_enabled_flag = start_tts_process(global_running_flag)
+    tts = TTSService(tts_queue, tts_enabled_flag)
+
+    recognizers = load_recognizers()
+
+    pause_frame_flag   = multiprocessing.Value('b', False)
+    pause_audio_flag    = multiprocessing.Value('b', False)
+
+
+    
+
+
+    annotation_queue = deque(maxlen=5)
+    overlay = FrameOverlay(annotation_queue)
+
+    
 
     args = parse_args()
     if args.update_iptables and sys.platform.startswith("linux"):
@@ -1006,255 +1191,108 @@ def main():
     
     streaming_client, device_client, observer, device, streaming_manager  = init_aria(args)
 
+    def audio_collector(global_running_flag, pause_audio_flag):
+        print("audio collector thread started!")
+        channels = 7
+        buffer = []
+        MAX_CHUNKS_PER_CYCLE = 15000
+
+        while global_running_flag.value:
+            if pause_audio_flag.value:
+                time.sleep(0.01)
+                continue
+            
+            drained = 0
+            buffer.clear()
+            while drained < MAX_CHUNKS_PER_CYCLE and observer.audio:
+                buffer.append(observer.audio.popleft())
+                drained += 1
+
+            if buffer:
+                mono = buffer[::channels]
+                audio_queue.append(mono)
+
+
+            time.sleep(0.01) 
     
-    camera_index = args.camera_index
-    model_name = args.model
-    caption_interval = args.caption_interval
-    global caption_lock
+    collector_thread = threading.Thread(
+    target=audio_collector,
+    args=(global_running_flag,pause_audio_flag),
+    daemon=True)
 
-    # profile18 is the only supported streaming profile with audio
-    samplerate = 48000
-    global channels
-    channels = 7
+    collector_thread.start()
+    
 
-    cameras = {
-        0: aria.CameraId.Rgb,
-        1: aria.CameraId.Slam1,
-        2: aria.CameraId.Slam2,
+
+
+
+    model = load_vlm_model()
+    vlm = VLMService(model)
+    initial_language = LanguageState(initial="en")
+    #initial_language = "en"
+
+    cv2.namedWindow("Aria View", cv2.WINDOW_NORMAL)
+
+    
+    print("STARTING KWS THREAD")
+    kws_thread = threading.Thread(
+    target=keyword_listener,
+    args=(fsm_queue, kw_flag, global_running_flag),
+    daemon=True
+    )
+    frame_thread = threading.Thread(
+        target=frame_producer,
+        args=(observer, fsm_queue, display_queue, global_running_flag, overlay, pause_frame_flag),
+        daemon=True
+    )
+    
+    frame_thread.start()
+    kws_thread.start()
+
+
+
+    
+
+   
+
+    
+    cleanup_funcs = [
+        lambda: tts_queue.put(None),
+        #lambda: cv2.destroyAllWindows(),
+        lambda: streaming_client.unsubscribe(),
+        lambda: streaming_manager.stop_streaming(),
+        lambda: device_client.disconnect(device),
+        lambda: tts_proc.terminate(),
+        lambda: tts_proc.join(timeout=2),
+        lambda: kws_thread.join(timeout=1),
+        lambda: frame_thread.join(timeout=1)
+        
+    ]
+    
+
+
+    handlers = {
+      Mode.WATCHING:   WatchingHandler(lang=initial_language),
+      Mode.CAPTIONING: CaptioningHandler(vlm, tts, annotation_queue, lang=initial_language),
+      Mode.GUIDING:    GuidingHandler(vlm, tts, annotation_queue, initial_language),
+      Mode.ASSISTANT:  AssistantHandler(vlm, tts, recognizers, annotation_queue,  observer, initial_language, kw_flag, event_queue=fsm_queue, pause_frame_flag=pause_frame_flag, pause_audio_flag=pause_audio_flag),
+      Mode.TERMINATE:  TerminateHandler(cleanup_funcs),
     }
 
+    # start event loop, kws listener, frame producer…
+    fsm = FSMEngine(initial=Mode.WATCHING, handlers=handlers, _event_queue=fsm_queue, global_running_flag=global_running_flag)
+    fsm_thread = threading.Thread(target=fsm.run)   # default daemon=False
+    fsm_thread.start()
 
-   
+    display_loop(display_queue=display_queue, fsm_queue=fsm_queue, global_running_flag=global_running_flag, overlay=overlay)
 
-    
-    
-
-    # Load in the VLM model
-    if args.mlx: #test mlx later
-        # Load LLava model and processor once, after threading is initialized
-        sys.path.insert(
-            0, os.path.abspath(os.path.join(os.getcwd(), "../mlx-examples/llava"))
-        )
-        model_name = "llava-hf/llava-1.5-7b-hf"
-        import llava_ifc
-
-        model = llava_ifc.LLavaMLX(model_name, {})
-    else:
-        # Use the Ollama interface
-        import ollama_ifc
-
-        model = ollama_ifc.OllamaVLM(model_name)
-        print(f"Using model: {model_name}")
-
-    
-    #initial mode is watching
-    response_processor = ResponseStateProcessor(model = model, mode="watching", tts_queue=tts_queue, language="en", kws_flag=keyword_listening_flag, tts_enabled_flag=tts_enabled_flag, add_caption_func=add_caption_to_queue)
-    kws_thread = threading.Thread(target=keyword_listener, args=(response_processor,), daemon=True)
-    kws_thread.start()
-    recognizer_manager = RecognizerManager(samplerate)
-
-    assistant_worker_thread = threading.Thread(target=assistant_worker, daemon=True)
-    assistant_worker_thread.start()
-    
-
-
-    latest_frame = None
-    frozen_image = None
-
-
-    
+    fsm_thread.join(timeout=1)
+    print("fsm thread cleaned. final shutdown")
 
 
 
-    #latest_instruction = ""
-    latest_caption = "No caption available"
-    caption_executor = ThreadPoolExecutor(max_workers=1)
-    assistant_executor = ThreadPoolExecutor(max_workers=1)
-
-    threading.Thread(target=caption_worker, args=(response_processor,), daemon=True).start()
-
-   
-    
-    def process_camera_image(camera_id, observer, images_dict):
-        """Extracts and processes a camera image from the observer and stores it."""
-        if camera_id in observer.images:
-            image = np.rot90(observer.images[camera_id], -1)
-            image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-            images_dict[camera_id] = image
-            del observer.images[camera_id]
-
-    
-    
-  
-
-
-    last_caption_time = time.time()  # Track the last time a caption was updated
-
-    images = {}
-    audio = []
-
-    # Start the program loop
-    try:
-        while not quit_keypress():
-            
-            # process 3 camera images
-            process_camera_image(aria.CameraId.Rgb, observer, images)
-            process_camera_image(aria.CameraId.Slam1, observer, images)
-            process_camera_image(aria.CameraId.Slam2, observer, images)
-
-            if observer.audio:
-                        
-                new_audio = observer.audio
-                mono_audio = new_audio[::channels]
-                audio_queue.append(mono_audio)
-
-            # Choose the image to put into the model
-            try:
-                latest_frame = images[cameras[camera_index]]
-            except:
-                print(f"No {cameras[camera_index]} image detected. {len(observer.images) = }")
-                continue
-
-            if frozen_image is None:
-                frozen_image = latest_frame
-
-            # Update caption based on mode
-            if response_processor.mode == "assisting" and not response_processor.assistant_processing:
-                    
-                assistant_queue.put((
-                frozen_image,
-                response_processor,
-                assistant_executor,
-                recognizer_manager,
-                observer,
-                args,
-                samplerate,
-                channels
-                ))
-                print("✅ Assistant query enqueued")
-                response_processor.assistant_processing = True
-
-            #continue
-
-            elif response_processor.mode == "watching":
-                pass
-            
-
-                # Captioning mode
-            elif response_processor.mode == "captioning" and not response_processor.assistant_processing:
-                
-                try:
-                    caption_queue.put_nowait((latest_frame, response_processor.language))
-                except queue.Full:
-                    print("[CaptionQueue] Queue full — skipping frame")
-
-            
-            
-
-            
-            
-            
-            
-            frame_with_caption = (
-                add_caption_to_frame(latest_frame)
-                if response_processor.mode == "captioning"
-                else latest_frame)
-
-
-            # Display the stream
-            cv2.imshow("Aria Glasses View", frame_with_caption)
-
-            # Handle input
-            key = cv2.waitKey(5) & 0xFF
-            # Quit
-            if key == ord("q"):
-                print("Exiting the loop.")
-                break
-
-            
-
-            
-            # Activate assisting mode
-            elif key == ord("v"): # if mode == "assisting"
-                #response_processor.mode == "captioning"
-                listening = False
-                #empty_and_lock_queue()
-                #stop_audio()
-                model.conversation = []  # New chat
-                model.conversation.append(
-                    {"role": "user", "content": assistant_prompt}
-                )  # Define role
-
-                #latest_caption = "Press 'o' and ask a question. Press 'p' to stop."
-                latest_caption = "Speak keyword 'computer' to activate listening mode."
-
-                print("Assisting mode is active")
-
-            # Toggle audio on/off
-            elif key == ord("a"):
-                audio_enabled = not audio_enabled
-                #stop_audio()
-                print(f"Audio {'enabled' if audio_enabled else 'disabled'}.")
-
-            # Switch camera
-            elif key == ord("1"):
-                camera_index = (
-                    camera_index + 1 if camera_index < len(cameras) - 1 else 0
-                )
-                print(f"Switching to camera: {cameras[camera_index]}")
-
-         
-            
-
-
-            # Print help
-            elif key == ord("h"):
-                display_help()
-
-    except Exception as e:
-        print("Oops! Something went wrong. Shutting down the stream...")
-        traceback.print_exc()
-    finally:
-        cv2.destroyAllWindows()
-
-        assistant_queue.put(None)
-
-
-        assistant_worker_thread.join()
-        caption_queue.put((None, None))  # to break caption_worker
-
-
-        caption_executor.shutdown()
-        assistant_executor.shutdown()
-        # Stop the keyword listener thread
-        if kws_thread.is_alive():
-            print("Stopping keyword listener thread...")
-            response_processor.disable_keyword_listening()
-            kws_thread.join(timeout=1)
-            if kws_thread.is_alive():
-                print("Keyword listener thread did not stop in time, forcefully terminating.")
-                kws_thread.join()
-
-        # Stop streaming and disconnect the glasses
-        print("Stop listening to image data")
-        streaming_client.unsubscribe()
-        streaming_manager.stop_streaming()
-        device_client.disconnect(device)
-
-        # Clean up the model after use
-        del model  
-
-        # Stop the worker thread
-        add_caption_to_queue(None)
-
-        tts_queue.put(None)
-        tts_proc.join()
-
-        del tts_queue
-        print("Stream stopped and device disconnected. Goodbye!")
 
 
 if __name__ == "__main__":
+    multiprocessing.set_start_method("spawn", force=True)
     main()
-
-
